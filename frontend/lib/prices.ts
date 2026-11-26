@@ -5,16 +5,20 @@
 
 /**
  * Fetch USD prices for the supported assets from our server route. Returns a
- * map like `{ XLM: 0.1123, USDC: 1 }`. Never throws — returns `{}` on failure.
+ * map like `{ XLM: 0.1123, USDC: 1 }`, or `null` on failure.
  */
-export async function fetchUsdPrices(): Promise<Record<string, number>> {
+export async function fetchUsdPrices(): Promise<Record<string, number> | null> {
   try {
     const res = await fetch('/api/prices', { headers: { accept: 'application/json' } });
-    if (!res.ok) return {};
+    if (!res.ok) return null;
     const json = await res.json();
-    return json.prices || {};
+    const prices = json?.prices;
+    if (!prices || typeof prices !== 'object' || Object.keys(prices).length === 0) {
+      return null;
+    }
+    return prices;
   } catch {
-    return {};
+    return null;
   }
 }
 

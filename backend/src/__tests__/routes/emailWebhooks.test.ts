@@ -7,6 +7,7 @@ jest.mock("../../prisma", () => ({
   },
 }));
 
+import { Prisma } from "@prisma/client";
 import { createHmac } from "crypto";
 import request from "supertest";
 import app from "../../app";
@@ -72,9 +73,74 @@ describe("POST /api/webhooks/email/resend", () => {
         subject: "Your subscription renewed",
         type: "BOUNCED",
         providerMessageId: "resend-abc",
+        svixId: "msg_test123",
         errorDetail: "mailbox does not exist",
       },
     });
+  });
+
+  it("records one BOUNCED event per recipient of a multi-recipient message (#534)", async () => {
+    const res = await postWebhook({
+      type: "email.bounced",
+      data: {
+        email_id: "resend-multi",
+        to: ["first@example.com", "Second@Example.com"],
+        subject: "Your subscription renewed",
+        bounce: { message: "mailbox does not exist" },
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(mockedPrisma.emailEvent.create).toHaveBeenCalledTimes(2);
+    expect(mockedPrisma.emailEvent.create).toHaveBeenNthCalledWith(1, {
+      data: {
+        recipient: "first@example.com",
+        subject: "Your subscription renewed",
+        type: "BOUNCED",
+        providerMessageId: "resend-multi",
+        errorDetail: "mailbox does not exist",
+      },
+    });
+    expect(mockedPrisma.emailEvent.create).toHaveBeenNthCalledWith(2, {
+      data: {
+        recipient: "second@example.com",
+        subject: "Your subscription renewed",
+        type: "BOUNCED",
+        providerMessageId: "resend-multi",
+        errorDetail: "mailbox does not exist",
+      },
+    });
+  });
+
+  it("normalizes a mixed-case recipient to lowercase before storing it (#534)", async () => {
+    const res = await postWebhook({
+      type: "email.bounced",
+      data: {
+        email_id: "resend-case",
+        to: ["Bob@X.com"],
+        subject: "Receipt",
+        bounce: { message: "mailbox does not exist" },
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(mockedPrisma.emailEvent.create).toHaveBeenCalledWith({
+      data: {
+        recipient: "bob@x.com",
+        subject: "Receipt",
+        type: "BOUNCED",
+        providerMessageId: "resend-case",
+        errorDetail: "mailbox does not exist",
+      },
+    });
+  });
+
+  it("acknowledges a verified payload with no data object instead of throwing (#534)", async () => {
+    const res = await postWebhook({ type: "email.bounced" });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ received: true });
+    expect(mockedPrisma.emailEvent.create).not.toHaveBeenCalled();
   });
 
   it("records a DELIVERED event for a validly signed email.delivered payload", async () => {
@@ -90,9 +156,38 @@ describe("POST /api/webhooks/email/resend", () => {
         subject: "Receipt",
         type: "DELIVERED",
         providerMessageId: "resend-def",
+        svixId: "msg_test123",
         errorDetail: undefined,
       },
     });
+  });
+
+  it("acknowledges a retried delivery without inserting a duplicate row", async () => {
+    const rows: Array<{ svixId: string }> = [];
+    mockedPrisma.emailEvent.create.mockImplementation(
+      async ({ data }: { data: { svixId: string } }) => {
+        if (rows.some((row) => row.svixId === data.svixId)) {
+          throw new Prisma.PrismaClientKnownRequestError("Unique constraint failed", {
+            code: "P2002",
+            clientVersion: "test",
+          });
+        }
+        rows.push(data);
+        return {};
+      },
+    );
+    const payload = {
+      type: "email.delivered",
+      data: { email_id: "resend-retry", to: ["supporter@example.com"], subject: "Receipt" },
+    };
+
+    const first = await postWebhook(payload);
+    const retry = await postWebhook(payload);
+
+    expect(first.status).toBe(200);
+    expect(retry.status).toBe(200);
+    expect(rows).toHaveLength(1);
+    expect(mockedPrisma.emailEvent.create).toHaveBeenCalledTimes(2);
   });
 
   it("acknowledges but does not record an event type it doesn't act on", async () => {

@@ -105,7 +105,8 @@ it.each([false, true])("replays listener events exactly once (client report firs
   const donations = await prisma.donation.findMany();
   expect(donations).toHaveLength(1);
   expect(donations[0]).toMatchObject({ verified: true, rpcEventId: event().id });
-  expect((await prisma.goal.findUniqueOrThrow({ where: { id: goal.id } })).currentAmount).toBe(10);
+  // Prisma returns DECIMAL columns as Decimal objects, not JS numbers.
+  expect(Number((await prisma.goal.findUniqueOrThrow({ where: { id: goal.id } })).currentAmount)).toBe(10);
 });
 
 it.each(["composite", "onChainEventId", "rpcEventId"])("enforces the %s unique constraint in Postgres", async (constraint) => {

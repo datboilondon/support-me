@@ -472,4 +472,23 @@ describe('SettingsPage', () => {
 
     expect(notify.error).toHaveBeenCalledWith('Enter at most 6 preset amounts.');
   });
+
+  it('shows a retry card instead of create-username CTA when creator fails to load', async () => {
+    const invalidate = vi.fn();
+    mockUseCreator.mockReturnValue({
+      creator: null,
+      loading: false,
+      error: 'Failed to load your profile',
+      invalidate,
+    });
+    const user = userEvent.setup();
+
+    render(<SettingsPage />);
+
+    expect(screen.getByText('Failed to load your profile')).toBeInTheDocument();
+    expect(screen.queryByText(/create a username first/i)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /retry/i }));
+    expect(invalidate).toHaveBeenCalledTimes(1);
+  });
 });

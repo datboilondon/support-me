@@ -25,8 +25,8 @@
 //! crate docs for the TTL constants.
 
 use common::{
-    extend_instance_ttl, extend_persistent_ttl, validate_admin_set, AdminAction, AdminProposal,
-    CreatorProfile, ADMIN_PROPOSAL_TTL_SECONDS,
+    extend_instance_ttl, extend_persistent_ttl, extend_proposal_ttl, validate_admin_set,
+    AdminAction, AdminProposal, CreatorProfile, ADMIN_PROPOSAL_TTL_SECONDS,
 };
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, symbol_short, Address, Env, String,
@@ -307,9 +307,11 @@ impl CreatorRegistryContract {
         env.storage()
             .persistent()
             .set(&(PROPOSAL_KEY, prop_id), &proposal);
+        extend_proposal_ttl(&env, &(PROPOSAL_KEY, prop_id), timelock);
         env.storage()
             .persistent()
             .set(&(APPROVAL_KEY, prop_id, proposer.clone()), &true);
+        extend_proposal_ttl(&env, &(APPROVAL_KEY, prop_id, proposer.clone()), timelock);
         let next_prop_id = match prop_id.checked_add(1) {
             Some(id) => id,
             None => soroban_sdk::panic_with_error!(&env, RegistryError::Overflow),
@@ -317,6 +319,7 @@ impl CreatorRegistryContract {
         env.storage()
             .persistent()
             .set(&PROPOSAL_COUNTER_KEY, &next_prop_id);
+        extend_persistent_ttl(&env, &PROPOSAL_COUNTER_KEY);
 
         ProposalCreatedEvent {
             proposal_id: prop_id,
@@ -362,9 +365,15 @@ impl CreatorRegistryContract {
             soroban_sdk::panic_with_error!(&env, RegistryError::AlreadyApproved);
         }
 
+        let timelock: u64 = env
+            .storage()
+            .instance()
+            .get(&TIMELOCK_DELAY_KEY)
+            .unwrap_or(0);
         env.storage()
             .persistent()
             .set(&(APPROVAL_KEY, proposal_id, admin.clone()), &true);
+        extend_proposal_ttl(&env, &(APPROVAL_KEY, proposal_id, admin.clone()), timelock);
         proposal.approvals_count = match proposal.approvals_count.checked_add(1) {
             Some(c) => c,
             None => soroban_sdk::panic_with_error!(&env, RegistryError::Overflow),
@@ -372,6 +381,7 @@ impl CreatorRegistryContract {
         env.storage()
             .persistent()
             .set(&(PROPOSAL_KEY, proposal_id), &proposal);
+        extend_proposal_ttl(&env, &(PROPOSAL_KEY, proposal_id), timelock);
 
         ProposalApprovedEvent {
             proposal_id,
@@ -413,9 +423,15 @@ impl CreatorRegistryContract {
                 !already_requested,
                 "admin has already requested cancellation"
             );
+            let timelock: u64 = env
+                .storage()
+                .instance()
+                .get(&TIMELOCK_DELAY_KEY)
+                .unwrap_or(0);
             env.storage()
                 .persistent()
                 .set(&(CANCEL_KEY, proposal_id, caller.clone()), &true);
+            extend_proposal_ttl(&env, &(CANCEL_KEY, proposal_id, caller.clone()), timelock);
 
             let requests = Self::count_current_admin_votes(&env, CANCEL_KEY, proposal_id);
             let threshold: u32 = env
@@ -428,10 +444,16 @@ impl CreatorRegistryContract {
             }
         }
 
+        let timelock: u64 = env
+            .storage()
+            .instance()
+            .get(&TIMELOCK_DELAY_KEY)
+            .unwrap_or(0);
         proposal.cancelled = true;
         env.storage()
             .persistent()
             .set(&(PROPOSAL_KEY, proposal_id), &proposal);
+        extend_proposal_ttl(&env, &(PROPOSAL_KEY, proposal_id), timelock);
 
         ProposalCancelledEvent {
             proposal_id,
@@ -565,10 +587,16 @@ impl CreatorRegistryContract {
             }
         }
 
+        let timelock: u64 = env
+            .storage()
+            .instance()
+            .get(&TIMELOCK_DELAY_KEY)
+            .unwrap_or(0);
         proposal.executed = true;
         env.storage()
             .persistent()
             .set(&(PROPOSAL_KEY, proposal_id), &proposal);
+        extend_proposal_ttl(&env, &(PROPOSAL_KEY, proposal_id), timelock);
 
         ProposalExecutedEvent {
             proposal_id,
@@ -1760,9 +1788,121 @@ mod tests {
     }
 
     #[test]
+    fn test_admin_proposal_extends_persistent_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin1 = Address::generate(&env);
+        let admin2 = Address::generate(&env);
+        let initial_donation = Address::generate(&env);
+        let new_donation = Address::generate(&env);
+
+        let contract_id = env.register(
+            CreatorRegistryContract,
+            (
+                vec![&env, admin1.clone(), admin2.clone()],
+                2u32,
+                50u64,
+                initial_donation,
+            ),
+        );
+        let client = CreatorRegistryContractClient::new(&env, &contract_id);
+
+        let prop_id = client.propose_admin_action(
+            &admin1,
+            &AdminAction::SetDonationContract(new_donation.clone()),
+        );
+
+        let expected_ttl = common::proposal_bump_amount(50);
+        assert_eq!(
+            persistent_ttl(&env, &client.address, &(PROPOSAL_KEY, prop_id)),
+            expected_ttl
+        );
+        assert_eq!(
+            persistent_ttl(
+                &env,
+                &client.address,
+                &(APPROVAL_KEY, prop_id, admin1.clone())
+            ),
+            expected_ttl
+        );
+        assert_eq!(
+            persistent_ttl(&env, &client.address, &PROPOSAL_COUNTER_KEY),
+            PERSISTENT_BUMP_AMOUNT
+        );
+
+        // Approve
+        client.approve_admin_action(&admin2, &prop_id);
+        assert_eq!(
+            persistent_ttl(
+                &env,
+                &client.address,
+                &(APPROVAL_KEY, prop_id, admin2.clone())
+            ),
+            expected_ttl
+        );
+        assert_eq!(
+            persistent_ttl(&env, &client.address, &(PROPOSAL_KEY, prop_id)),
+            expected_ttl
+        );
+
+        // Execute
+        env.ledger().with_mut(|li| li.timestamp = 60);
+        client.execute_admin_action(&admin1, &prop_id);
+        assert_eq!(
+            persistent_ttl(&env, &client.address, &(PROPOSAL_KEY, prop_id)),
+            expected_ttl
+        );
+    }
+
+    #[test]
+    fn test_admin_proposal_cancel_extends_persistent_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin1 = Address::generate(&env);
+        let admin2 = Address::generate(&env);
+        let contract_id = env.register(
+            CreatorRegistryContract,
+            (
+                vec![&env, admin1.clone(), admin2.clone()],
+                2u32,
+                100u64,
+                Address::generate(&env),
+            ),
+        );
+        let client = CreatorRegistryContractClient::new(&env, &contract_id);
+
+        let prop_id = client.propose_admin_action(
+            &admin1,
+            &AdminAction::SetDonationContract(Address::generate(&env)),
+        );
+
+        // Admin2 requests cancellation
+        client.cancel_admin_action(&admin2, &prop_id);
+        let expected_ttl = common::proposal_bump_amount(100);
+        assert_eq!(
+            persistent_ttl(
+                &env,
+                &client.address,
+                &(CANCEL_KEY, prop_id, admin2.clone())
+            ),
+            expected_ttl
+        );
+
+        // Proposer cancels unilaterally
+        client.cancel_admin_action(&admin1, &prop_id);
+        assert_eq!(
+            persistent_ttl(&env, &client.address, &(PROPOSAL_KEY, prop_id)),
+            expected_ttl
+        );
+    }
+
+    #[test]
     fn test_approve_rejects_cancelled_and_expired_proposals() {
         let env = Env::default();
         env.mock_all_auths();
+
         let admin1 = Address::generate(&env);
         let admin2 = Address::generate(&env);
         let contract_id = env.register(
@@ -1795,6 +1935,7 @@ mod tests {
             client.try_approve_admin_action(&admin2, &prop2_id),
             Err(Ok(RegistryError::ProposalExpired.into()))
         );
+    }
     }
 
     #[test]

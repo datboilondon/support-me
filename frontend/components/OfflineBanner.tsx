@@ -54,7 +54,10 @@ export function OfflineBanner() {
       if (failure && online) {
         await failure.retry();
       } else {
-        await fetch(`${API_URL}/health`, { cache: 'no-store' });
+        const res = await fetch(`${API_URL}/health`, { cache: 'no-store' });
+        if (!res.ok) {
+          throw new Error(`Health check failed with status ${res.status}`);
+        }
         clearNetworkFailure();
         window.dispatchEvent(new Event('online'));
         notify.success('Back online');

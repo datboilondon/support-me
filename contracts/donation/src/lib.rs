@@ -32,8 +32,8 @@
 //! idle periods. See the `common` crate docs for the TTL constants.
 
 use common::{
-    extend_instance_ttl, extend_persistent_ttl, extend_subscription_ttl, validate_admin_set,
-    AdminAction, AdminProposal, CreatorProfile, DonationRecord, Subscription,
+    extend_instance_ttl, extend_persistent_ttl, extend_proposal_ttl, extend_subscription_ttl,
+    validate_admin_set, AdminAction, AdminProposal, CreatorProfile, DonationRecord, Subscription,
     ADMIN_PROPOSAL_TTL_SECONDS,
 };
 use soroban_sdk::{
@@ -325,6 +325,31 @@ pub struct DonationContract;
 
 #[contractimpl]
 impl DonationContract {
+    /// Runs atomically as part of deployment, so no one can race the deployer
+    /// to claim the admin set. `admins[0]` is the primary admin used by the
+    /// single-admin config shortcuts (`set_executor`, token allowlist, donation
+    /// limits). A 1-of-1 deployment passes a single admin and threshold 1.
+    pub fn __constructor(
+        env: Env,
+        admins: Vec<Address>,
+        threshold: u32,
+        timelock_delay: u64,
+        registry: Address,
+    ) {
+        validate_admin_set(&admins, threshold);
+
+        let primary_admin = admins.get(0).unwrap();
+        env.storage().instance().set(&ADMIN_KEY, &primary_admin);
+        env.storage().instance().set(&ADMINS_KEY, &admins);
+        env.storage().instance().set(&THRESHOLD_KEY, &threshold);
+        env.storage()
+            .instance()
+            .set(&TIMELOCK_DELAY_KEY, &timelock_delay);
+        env.storage().instance().set(&PAUSED_KEY, &false);
+        env.storage().instance().set(&REGISTRY_KEY, &registry);
+        extend_instance_ttl(&env);
+    }
+
     /// One-time single-admin setup: backwards compatible wrapper initializing 1-of-1 admin setup.
     pub fn initialize(env: Env, admin: Address, registry: Address) {
         admin.require_auth();
@@ -459,6 +484,7 @@ impl DonationContract {
             None => soroban_sdk::panic_with_error!(&env, DonationError::Overflow),
         };
 
+        extend_instance_ttl(&env);
         let proposal = AdminProposal {
             id: prop_id,
             action,
@@ -474,9 +500,11 @@ impl DonationContract {
         env.storage()
             .persistent()
             .set(&(PROPOSAL_KEY, prop_id), &proposal);
+        extend_proposal_ttl(&env, &(PROPOSAL_KEY, prop_id), timelock);
         env.storage()
             .persistent()
             .set(&(APPROVAL_KEY, prop_id, proposer.clone()), &true);
+        extend_proposal_ttl(&env, &(APPROVAL_KEY, prop_id, proposer.clone()), timelock);
         let next_prop_id = match prop_id.checked_add(1) {
             Some(id) => id,
             None => soroban_sdk::panic_with_error!(&env, DonationError::Overflow),
@@ -484,6 +512,7 @@ impl DonationContract {
         env.storage()
             .persistent()
             .set(&PROPOSAL_COUNTER_KEY, &next_prop_id);
+        extend_persistent_ttl(&env, &PROPOSAL_COUNTER_KEY);
 
         extend_instance_ttl(&env);
         ProposalCreatedEvent {
@@ -503,6 +532,7 @@ impl DonationContract {
         if !Self::is_admin(env.clone(), admin.clone()) {
             soroban_sdk::panic_with_error!(&env, DonationError::Unauthorized);
         }
+        extend_instance_ttl(&env);
 
         let mut proposal: AdminProposal =
             match env.storage().persistent().get(&(PROPOSAL_KEY, proposal_id)) {
@@ -529,9 +559,15 @@ impl DonationContract {
             soroban_sdk::panic_with_error!(&env, DonationError::AlreadyApproved);
         }
 
+        let timelock: u64 = env
+            .storage()
+            .instance()
+            .get(&TIMELOCK_DELAY_KEY)
+            .unwrap_or(0);
         env.storage()
             .persistent()
             .set(&(APPROVAL_KEY, proposal_id, admin.clone()), &true);
+        extend_proposal_ttl(&env, &(APPROVAL_KEY, proposal_id, admin.clone()), timelock);
         proposal.approvals_count = match proposal.approvals_count.checked_add(1) {
             Some(c) => c,
             None => soroban_sdk::panic_with_error!(&env, DonationError::Overflow),
@@ -539,6 +575,7 @@ impl DonationContract {
         env.storage()
             .persistent()
             .set(&(PROPOSAL_KEY, proposal_id), &proposal);
+        extend_proposal_ttl(&env, &(PROPOSAL_KEY, proposal_id), timelock);
 
         extend_instance_ttl(&env);
         ProposalApprovedEvent {
@@ -581,9 +618,15 @@ impl DonationContract {
                 !already_requested,
                 "admin has already requested cancellation"
             );
+            let timelock: u64 = env
+                .storage()
+                .instance()
+                .get(&TIMELOCK_DELAY_KEY)
+                .unwrap_or(0);
             env.storage()
                 .persistent()
                 .set(&(CANCEL_KEY, proposal_id, caller.clone()), &true);
+            extend_proposal_ttl(&env, &(CANCEL_KEY, proposal_id, caller.clone()), timelock);
 
             let requests = Self::count_current_admin_votes(&env, CANCEL_KEY, proposal_id);
             let threshold: u32 = env
@@ -596,10 +639,16 @@ impl DonationContract {
             }
         }
 
+        let timelock: u64 = env
+            .storage()
+            .instance()
+            .get(&TIMELOCK_DELAY_KEY)
+            .unwrap_or(0);
         proposal.cancelled = true;
         env.storage()
             .persistent()
             .set(&(PROPOSAL_KEY, proposal_id), &proposal);
+        extend_proposal_ttl(&env, &(PROPOSAL_KEY, proposal_id), timelock);
 
         ProposalCancelledEvent {
             proposal_id,
@@ -614,6 +663,7 @@ impl DonationContract {
         if !Self::is_admin(env.clone(), executor.clone()) {
             soroban_sdk::panic_with_error!(&env, DonationError::Unauthorized);
         }
+        extend_instance_ttl(&env);
 
         let mut proposal: AdminProposal =
             match env.storage().persistent().get(&(PROPOSAL_KEY, proposal_id)) {
@@ -755,10 +805,16 @@ impl DonationContract {
             }
         }
 
+        let timelock: u64 = env
+            .storage()
+            .instance()
+            .get(&TIMELOCK_DELAY_KEY)
+            .unwrap_or(0);
         proposal.executed = true;
         env.storage()
             .persistent()
             .set(&(PROPOSAL_KEY, proposal_id), &proposal);
+        extend_proposal_ttl(&env, &(PROPOSAL_KEY, proposal_id), timelock);
 
         extend_instance_ttl(&env);
         ProposalExecutedEvent {
@@ -795,6 +851,7 @@ impl DonationContract {
         if Self::is_paused(env.clone()) {
             soroban_sdk::panic_with_error!(&env, DonationError::Paused);
         }
+        extend_instance_ttl(&env);
         let registry = Self::registry_address(&env);
         let args: Vec<Val> = (creator, username).into_val(&env);
         let profile = env.invoke_contract(&registry, &Symbol::new(&env, "register_creator"), args);
@@ -1065,7 +1122,11 @@ impl DonationContract {
         if Self::is_paused(env.clone()) {
             soroban_sdk::panic_with_error!(&env, DonationError::Paused);
         }
+        extend_instance_ttl(&env);
         donor.require_auth();
+        if donor == creator {
+            soroban_sdk::panic_with_error!(&env, DonationError::SelfDonation);
+        }
         if amount <= 0 {
             soroban_sdk::panic_with_error!(&env, DonationError::InvalidAmount);
         }
@@ -1123,6 +1184,7 @@ impl DonationContract {
         env.storage()
             .persistent()
             .set(&DONATION_COUNTER, &next_counter);
+        extend_persistent_ttl(&env, &DONATION_COUNTER);
 
         extend_instance_ttl(&env);
         DonatedEvent {
@@ -1152,7 +1214,11 @@ impl DonationContract {
         if Self::is_paused(env.clone()) {
             soroban_sdk::panic_with_error!(&env, DonationError::Paused);
         }
+        extend_instance_ttl(&env);
         supporter.require_auth();
+        if supporter == creator {
+            soroban_sdk::panic_with_error!(&env, DonationError::SelfDonation);
+        }
         if amount <= 0 {
             soroban_sdk::panic_with_error!(&env, DonationError::InvalidAmount);
         }
@@ -1196,11 +1262,13 @@ impl DonationContract {
         env.storage()
             .persistent()
             .set(&(SUBSCRIPTIONS_KEY, id), &subscription);
+        extend_subscription_ttl(&env, &(SUBSCRIPTIONS_KEY, id), interval_secs);
         let next_id = match id.checked_add(1) {
             Some(next) => next,
             None => soroban_sdk::panic_with_error!(&env, DonationError::Overflow),
         };
         env.storage().persistent().set(&SUB_COUNTER, &next_id);
+        extend_persistent_ttl(&env, &SUB_COUNTER);
 
         Self::adjust_committed_amount(&env, &supporter, &token, amount);
 
@@ -1260,6 +1328,7 @@ impl DonationContract {
         if executor != authorized_executor {
             soroban_sdk::panic_with_error!(&env, DonationError::Unauthorized);
         }
+        extend_instance_ttl(&env);
 
         let mut subscription: Subscription = match env
             .storage()
@@ -1393,6 +1462,7 @@ impl DonationContract {
         env.storage()
             .persistent()
             .set(&DONATION_COUNTER, &next_counter);
+        extend_persistent_ttl(&env, &DONATION_COUNTER);
 
         DonatedEvent {
             donor: subscription.supporter.clone(),
@@ -1606,8 +1676,19 @@ mod tests {
     use super::*;
     use creator_registry::{CreatorRegistryContract, CreatorRegistryContractClient};
     use soroban_sdk::events::Event as _;
-    use soroban_sdk::testutils::{storage::Instance as _, Address as _, Events as _, Ledger};
+    use soroban_sdk::testutils::{
+        storage::{Instance as _, Persistent as _},
+        Address as _, Events as _, Ledger,
+    };
     use soroban_sdk::token::StellarAssetClient;
+
+    fn instance_ttl(env: &Env, contract: &Address) -> u32 {
+        env.as_contract(contract, || env.storage().instance().get_ttl())
+    }
+
+    fn persistent_ttl<K: IntoVal<Env, Val>>(env: &Env, contract: &Address, key: &K) -> u32 {
+        env.as_contract(contract, || env.storage().persistent().get_ttl(key))
+    }
 
     fn create_token_contract(env: &Env, admin: &Address) -> Address {
         env.register_stellar_asset_contract_v2(admin.clone())
@@ -1623,20 +1704,23 @@ mod tests {
         DonationContractClient<'_>,
         CreatorRegistryContractClient<'_>,
     ) {
-        let donation_id = env.register(DonationContract, ());
-        let registry_id = env.register(
-            CreatorRegistryContract,
+        let registry_id = Address::generate(env);
+        let donation_id = env.register(
+            DonationContract,
             (
                 admins.clone(),
                 threshold,
                 timelock_delay,
-                donation_id.clone(),
+                registry_id.clone(),
             ),
         );
-        let donation_client = DonationContractClient::new(env, &donation_id);
-        donation_client.initialize_multisig(&admins, &threshold, &timelock_delay, &registry_id);
+        env.register_at(
+            &registry_id,
+            CreatorRegistryContract,
+            (admins, threshold, timelock_delay, donation_id.clone()),
+        );
         (
-            donation_client,
+            DonationContractClient::new(env, &donation_id),
             CreatorRegistryContractClient::new(env, &registry_id),
         )
     }
@@ -3711,6 +3795,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     #[should_panic(expected = "duplicate admin in admin list")]
     fn test_initialize_multisig_rejects_duplicate_admins() {
         let env = Env::default();
@@ -3916,6 +4001,294 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "admin list cannot be empty")]
+    fn test_constructor_rejects_empty_admin_list() {
+        let env = Env::default();
+        env.register(
+            DonationContract,
+            (
+                Vec::<Address>::new(&env),
+                1u32,
+                0u64,
+                Address::generate(&env),
+            ),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid signature threshold")]
+    fn test_constructor_rejects_zero_threshold() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        env.register(
+            DonationContract,
+            (
+                Vec::from_array(&env, [admin]),
+                0u32,
+                0u64,
+                Address::generate(&env),
+            ),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid signature threshold")]
+    fn test_constructor_rejects_threshold_greater_than_admins() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        env.register(
+            DonationContract,
+            (
+                Vec::from_array(&env, [admin]),
+                2u32,
+                0u64,
+                Address::generate(&env),
+            ),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate admin in admin list")]
+    fn test_constructor_rejects_duplicate_admins() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        env.register(
+            DonationContract,
+            (
+                Vec::from_array(&env, [admin.clone(), admin]),
+                1u32,
+                0u64,
+                Address::generate(&env),
+            ),
+        );
+    }
+
+    #[test]
+    fn test_initializers_panic_after_construction() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (admin, donation_client, registry_client) = setup(&env);
+
+        let other_admin = Address::generate(&env);
+        let res_init = donation_client.try_initialize(&other_admin, &registry_client.address);
+        assert_eq!(
+            res_init.unwrap_err().unwrap(),
+            DonationError::AlreadyInitialized.into()
+        );
+
+        let admins = Vec::from_array(&env, [other_admin]);
+        let res_multisig = donation_client.try_initialize_multisig(
+            &admins,
+            &1u32,
+            &0u64,
+            &registry_client.address,
+        );
+        assert_eq!(
+            res_multisig.unwrap_err().unwrap(),
+            DonationError::AlreadyInitialized.into()
+        );
+
+        assert!(donation_client.is_admin(&admin));
+    }
+
+    #[test]
+    fn test_state_changing_calls_extend_instance_ttl() {
+        use common::{DAY_IN_LEDGERS, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD};
+
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (admin, donation_client, registry_client) = setup(&env);
+
+        let donor = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let executor = Address::generate(&env);
+        let token_address = create_token_contract(&env, &admin);
+        donation_client.add_allowed_token(&token_address);
+        donation_client.set_executor(&executor);
+        StellarAssetClient::new(&env, &token_address).mint(&donor, &1_000_000);
+
+        // 1. donate extends instance TTL
+        env.ledger()
+            .with_mut(|li| li.sequence_number += INSTANCE_BUMP_AMOUNT - 2 * DAY_IN_LEDGERS);
+        assert!(instance_ttl(&env, &donation_client.address) < INSTANCE_LIFETIME_THRESHOLD);
+        donation_client.donate(
+            &donor,
+            &creator,
+            &token_address,
+            &100,
+            &String::from_str(&env, ""),
+        );
+        assert_eq!(
+            instance_ttl(&env, &donation_client.address),
+            INSTANCE_BUMP_AMOUNT
+        );
+
+        // 2. subscribe extends instance TTL
+        env.ledger()
+            .with_mut(|li| li.sequence_number += INSTANCE_BUMP_AMOUNT - 2 * DAY_IN_LEDGERS);
+        assert!(instance_ttl(&env, &donation_client.address) < INSTANCE_LIFETIME_THRESHOLD);
+        let sub_id = donation_client.subscribe(&donor, &creator, &token_address, &50, &86_400);
+        assert_eq!(
+            instance_ttl(&env, &donation_client.address),
+            INSTANCE_BUMP_AMOUNT
+        );
+
+        // 3. charge_subscription extends instance TTL
+        let token_client = token::Client::new(&env, &token_address);
+        let exp_ledger = env.ledger().sequence() + INSTANCE_BUMP_AMOUNT;
+        token_client.approve(&donor, &donation_client.address, &10_000, &exp_ledger);
+        env.ledger().with_mut(|li| {
+            li.sequence_number += INSTANCE_BUMP_AMOUNT - 2 * DAY_IN_LEDGERS;
+            li.timestamp += 86_400;
+        });
+        assert!(instance_ttl(&env, &donation_client.address) < INSTANCE_LIFETIME_THRESHOLD);
+        donation_client.charge_subscription(&executor, &sub_id);
+        assert_eq!(
+            instance_ttl(&env, &donation_client.address),
+            INSTANCE_BUMP_AMOUNT
+        );
+
+        // 4. register_creator pass-through extends instance TTL
+        env.ledger()
+            .with_mut(|li| li.sequence_number += INSTANCE_BUMP_AMOUNT - 2 * DAY_IN_LEDGERS);
+        assert!(instance_ttl(&env, &donation_client.address) < INSTANCE_LIFETIME_THRESHOLD);
+        let new_creator = Address::generate(&env);
+        donation_client.register_creator(&new_creator, &String::from_str(&env, "new_dev"));
+        assert_eq!(
+            instance_ttl(&env, &donation_client.address),
+            INSTANCE_BUMP_AMOUNT
+        );
+        assert!(registry_client.get_creator(&new_creator).is_some());
+    }
+
+    #[test]
+    fn test_admin_proposals_extend_instance_and_persistent_ttl() {
+        use common::{
+            DAY_IN_LEDGERS, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        };
+
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin1 = Address::generate(&env);
+        let admin2 = Address::generate(&env);
+        let mut admins = Vec::new(&env);
+        admins.push_back(admin1.clone());
+        admins.push_back(admin2.clone());
+
+        let (donation_client, _) = deploy_pair(&env, admins, 2, 50);
+
+        // Decay instance TTL
+        env.ledger()
+            .with_mut(|li| li.sequence_number += INSTANCE_BUMP_AMOUNT - 2 * DAY_IN_LEDGERS);
+        assert!(instance_ttl(&env, &donation_client.address) < INSTANCE_LIFETIME_THRESHOLD);
+
+        // Propose
+        let new_exec = Address::generate(&env);
+        let prop_id = donation_client
+            .propose_admin_action(&admin1, &AdminAction::SetExecutor(new_exec.clone()));
+        assert_eq!(
+            instance_ttl(&env, &donation_client.address),
+            INSTANCE_BUMP_AMOUNT
+        );
+
+        let expected_prop_ttl = common::proposal_bump_amount(50);
+        assert_eq!(
+            persistent_ttl(&env, &donation_client.address, &(PROPOSAL_KEY, prop_id)),
+            expected_prop_ttl
+        );
+        assert_eq!(
+            persistent_ttl(
+                &env,
+                &donation_client.address,
+                &(APPROVAL_KEY, prop_id, admin1.clone())
+            ),
+            expected_prop_ttl
+        );
+        assert_eq!(
+            persistent_ttl(&env, &donation_client.address, &PROPOSAL_COUNTER_KEY),
+            PERSISTENT_BUMP_AMOUNT
+        );
+
+        // Decay instance TTL again before approve
+        env.ledger()
+            .with_mut(|li| li.sequence_number += INSTANCE_BUMP_AMOUNT - 2 * DAY_IN_LEDGERS);
+        assert!(instance_ttl(&env, &donation_client.address) < INSTANCE_LIFETIME_THRESHOLD);
+
+        donation_client.approve_admin_action(&admin2, &prop_id);
+        assert_eq!(
+            instance_ttl(&env, &donation_client.address),
+            INSTANCE_BUMP_AMOUNT
+        );
+        assert_eq!(
+            persistent_ttl(
+                &env,
+                &donation_client.address,
+                &(APPROVAL_KEY, prop_id, admin2.clone())
+            ),
+            expected_prop_ttl
+        );
+        assert!(
+            persistent_ttl(&env, &donation_client.address, &(PROPOSAL_KEY, prop_id))
+                >= expected_prop_ttl - 30 * DAY_IN_LEDGERS
+        );
+
+        // Decay instance TTL again before execute
+        env.ledger().with_mut(|li| {
+            li.sequence_number += INSTANCE_BUMP_AMOUNT - 2 * DAY_IN_LEDGERS;
+            li.timestamp += 60;
+        });
+        assert!(instance_ttl(&env, &donation_client.address) < INSTANCE_LIFETIME_THRESHOLD);
+
+        donation_client.execute_admin_action(&admin1, &prop_id);
+        assert_eq!(
+            instance_ttl(&env, &donation_client.address),
+            INSTANCE_BUMP_AMOUNT
+        );
+        assert!(
+            persistent_ttl(&env, &donation_client.address, &(PROPOSAL_KEY, prop_id))
+                >= expected_prop_ttl - 30 * DAY_IN_LEDGERS
+        );
+    }
+
+    #[test]
+    fn test_admin_proposal_cancel_extends_persistent_ttl() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin1 = Address::generate(&env);
+        let admin2 = Address::generate(&env);
+        let mut admins = Vec::new(&env);
+        admins.push_back(admin1.clone());
+        admins.push_back(admin2.clone());
+
+        let (donation_client, _) = deploy_pair(&env, admins, 2, 100);
+
+        let prop_id = donation_client
+            .propose_admin_action(&admin1, &AdminAction::SetExecutor(Address::generate(&env)));
+
+        // Admin2 requests cancellation
+        donation_client.cancel_admin_action(&admin2, &prop_id);
+        let expected_ttl = common::proposal_bump_amount(100);
+        assert_eq!(
+            persistent_ttl(
+                &env,
+                &donation_client.address,
+                &(CANCEL_KEY, prop_id, admin2.clone())
+            ),
+            expected_ttl
+        );
+
+        // Proposer cancels
+        donation_client.cancel_admin_action(&admin1, &prop_id);
+        assert_eq!(
+            persistent_ttl(&env, &donation_client.address, &(PROPOSAL_KEY, prop_id)),
+            expected_ttl
+        );
+    }
+
+    #[test]
     fn test_non_admin_propose_and_approve_rejected() {
         let env = Env::default();
         env.mock_all_auths();
@@ -3976,5 +4349,44 @@ mod tests {
 
         // Non-existent subscription bump fails
         assert!(client.try_bump_subscription(&9999).is_err());
+    }
+
+    #[test]
+    fn test_subscribe_and_donate_extend_persistent_counters_and_entry_ttl() {
+        use common::PERSISTENT_BUMP_AMOUNT;
+
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (admin, donation_client, _registry_client) = setup(&env);
+
+        let supporter = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token_address = create_token_contract(&env, &admin);
+        donation_client.add_allowed_token(&token_address);
+        StellarAssetClient::new(&env, &token_address).mint(&supporter, &100_000);
+
+        let sub_id = donation_client.subscribe(&supporter, &creator, &token_address, &100, &86_400);
+
+        let expected_sub_ttl = common::subscription_bump_amount(86_400);
+        assert_eq!(
+            persistent_ttl(&env, &donation_client.address, &(SUBSCRIPTIONS_KEY, sub_id)),
+            expected_sub_ttl
+        );
+        assert_eq!(
+            persistent_ttl(&env, &donation_client.address, &SUB_COUNTER),
+            PERSISTENT_BUMP_AMOUNT
+        );
+
+        donation_client.donate(
+            &supporter,
+            &creator,
+            &token_address,
+            &100,
+            &String::from_str(&env, "test"),
+        );
+        assert_eq!(
+            persistent_ttl(&env, &donation_client.address, &DONATION_COUNTER),
+            PERSISTENT_BUMP_AMOUNT
+        );
     }
 }

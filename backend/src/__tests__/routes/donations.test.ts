@@ -10,6 +10,7 @@ jest.mock("../../prisma", () => ({
     },
     donation: {
       findMany: jest.fn(),
+      findFirst: jest.fn(),
       count: jest.fn(),
       create: jest.fn(),
       upsert: jest.fn(),
@@ -37,6 +38,7 @@ jest.mock("../../services/email/mailer", () => ({
 
 import request from "supertest";
 import app from "../../app";
+import { donationIpLimiter, donationSenderLimiter } from "../../routes/donations";
 import prisma from "../../prisma";
 import { sendEmail } from "../../services/email/mailer";
 import { hashDonationRequest } from "../../lib/idempotency";
@@ -52,7 +54,13 @@ const REPLAY_BODY = {
 const mockedPrisma = prisma as unknown as {
   creator: { findUnique: jest.Mock; findFirst: jest.Mock };
   user: { findUnique: jest.Mock };
-  donation: { findMany: jest.Mock; count: jest.Mock; create: jest.Mock; upsert: jest.Mock };
+  donation: {
+    findMany: jest.Mock;
+    findFirst: jest.Mock;
+    count: jest.Mock;
+    create: jest.Mock;
+    upsert: jest.Mock;
+  };
   donationIdempotencyKey: {
     findMany: jest.Mock;
     deleteMany: jest.Mock;
@@ -68,6 +76,8 @@ const mockedSendEmail = sendEmail as jest.MockedFunction<typeof sendEmail>;
 
 beforeEach(() => {
   jest.clearAllMocks();
+  donationIpLimiter.clear();
+  donationSenderLimiter.clear();
   mockedPrisma.$transaction.mockImplementation((callback: (client: typeof mockedPrisma) => unknown) =>
     callback(mockedPrisma)
   );
@@ -132,7 +142,111 @@ describe("GET /api/donations", () => {
   });
 });
 
+describe("GET /api/donations/:transactionHash (#448)", () => {
+  const TX_HASH = "abc123def456";
+
+  it("returns a verified donation with its creator for the receipt page", async () => {
+    mockedPrisma.donation.findFirst.mockResolvedValue({
+      transactionHash: TX_HASH,
+      amount: { toString: () => "25" },
+      currency: "XLM",
+      message: "Keep it up",
+      createdAt: new Date("2026-11-19T10:00:00.000Z"),
+      verified: true,
+      creator: { username: "maya", displayName: "Maya", avatarUrl: null },
+    });
+
+    const res = await request(app).get(`/api/donations/${TX_HASH}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      transactionHash: TX_HASH,
+      amount: "25",
+      currency: "XLM",
+      message: "Keep it up",
+      createdAt: "2026-11-19T10:00:00.000Z",
+      verified: true,
+      creator: { username: "maya", displayName: "Maya", avatarUrl: null },
+    });
+    // Only on-chain-verified rows may back a receipt.
+    expect(mockedPrisma.donation.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { transactionHash: TX_HASH, verified: true } })
+    );
+  });
+
+  it("does not expose the sender's wallet address", async () => {
+    mockedPrisma.donation.findFirst.mockResolvedValue({
+      transactionHash: TX_HASH,
+      amount: { toString: () => "25" },
+      currency: "XLM",
+      message: null,
+      createdAt: new Date("2026-11-19T10:00:00.000Z"),
+      verified: true,
+      creator: { username: "maya", displayName: "Maya", avatarUrl: null },
+    });
+
+    const res = await request(app).get(`/api/donations/${TX_HASH}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.senderAddress).toBeUndefined();
+  });
+
+  it("returns 404 when no verified donation matches the transaction hash", async () => {
+    mockedPrisma.donation.findFirst.mockResolvedValue(null);
+
+    const res = await request(app).get("/api/donations/unknown-hash");
+
+    expect(res.status).toBe(404);
+    expect(res.body.code).toBe("NOT_FOUND");
+  });
+});
+
 describe("POST /api/donations", () => {
+  it.each([
+    ["XLM", { acceptsXlm: false, acceptsUsdc: true, acceptsUsdt: true }, "USDC, USDT"],
+    ["USDC", { acceptsXlm: true, acceptsUsdc: false, acceptsUsdt: true }, "XLM, USDT"],
+    ["USDT", { acceptsXlm: true, acceptsUsdc: true, acceptsUsdt: false }, "XLM, USDC"],
+  ])("rejects %s when the creator has disabled it", async (currency, preferences, allowed) => {
+    mockedPrisma.creator.findUnique.mockResolvedValue({
+      id: 7,
+      username: "bob",
+      ...preferences,
+    });
+
+    const res = await request(app)
+      .post("/api/donations")
+      .set("Idempotency-Key", `disabled-${currency}`)
+      .send({
+        creatorUsername: "bob",
+        senderAddress: "GA7D5LDGFABXNYEO6LZVMTWK5JWEPTODCLYZ7TG4XDZRKKXP6OS5K5JW",
+        amount: 10,
+        currency,
+        transactionHash: `tx-disabled-${currency}`,
+      });
+
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("BAD_REQUEST");
+    expect(res.body.error).toContain(`Allowed currencies: ${allowed}`);
+    expect(mockedPrisma.donation.upsert).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unknown currency code", async () => {
+    const res = await request(app)
+      .post("/api/donations")
+      .set("Idempotency-Key", "unknown-currency")
+      .send({
+        creatorUsername: "bob",
+        senderAddress: "GA7D5LDGFABXNYEO6LZVMTWK5JWEPTODCLYZ7TG4XDZRKKXP6OS5K5JW",
+        amount: 10,
+        currency: "DOGE",
+        transactionHash: "tx-unknown-currency",
+      });
+
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("VALIDATION_ERROR");
+    expect(mockedPrisma.creator.findUnique).not.toHaveBeenCalled();
+  });
+
   it("rejects a request without an idempotency key", async () => {
     const res = await request(app).post("/api/donations").send({
       creatorUsername: "bob",
@@ -465,11 +579,13 @@ describe("POST /api/donations", () => {
     expect(mockedSendEmail).not.toHaveBeenCalled();
   });
 
-  // Issue #18: USDT is just another asset code — createDonationSchema's
-  // `currency` field isn't an enum of known assets, so nothing here should
-  // need special-casing for a new one to work end-to-end.
+  // Issue #18: USDT is supported when the creator has opted into it.
   it("records a provisional USDT donation without applying it to goals", async () => {
-    mockedPrisma.creator.findUnique.mockResolvedValue({ id: 7, username: "bob" });
+    mockedPrisma.creator.findUnique.mockResolvedValue({
+      id: 7,
+      username: "bob",
+      acceptsUsdt: true,
+    });
     mockedPrisma.donation.upsert.mockResolvedValue({
       id: 1,
       creatorId: 7,
@@ -517,7 +633,11 @@ describe("POST /api/donations", () => {
   });
 
   it("does not apply a USDT donation to an XLM-denominated goal", async () => {
-    mockedPrisma.creator.findUnique.mockResolvedValue({ id: 7, username: "bob" });
+    mockedPrisma.creator.findUnique.mockResolvedValue({
+      id: 7,
+      username: "bob",
+      acceptsUsdt: true,
+    });
     mockedPrisma.donation.upsert.mockResolvedValue({ id: 1, creatorId: 7, amount: 25, currency: "USDT" });
     // findMany is already scoped by currency in the query, so an XLM goal
     // would never be returned for a USDT donation — asserting the empty

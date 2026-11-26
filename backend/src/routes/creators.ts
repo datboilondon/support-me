@@ -23,6 +23,7 @@ import { challenges } from "./auth";
 import { verifyWalletOwnership } from "../services/walletProof";
 import { TtlCache } from "../services/ttlCache";
 import { toAmount, MoneyValue } from "../lib/money";
+import { toPublicCreator } from "../lib/publicCreator";
 import { getCreatorStats } from "../services/creatorStats";
 
 const router = Router();
@@ -30,7 +31,8 @@ const router = Router();
 // Cache creator profile lookups by username with a 5-minute TTL.
 // Profiles change infrequently, so this reduces DB load while staying fresh.
 // Exported so tests can reset it between cases.
-export const creatorProfileCache = new TtlCache<Creator>(5 * 60 * 1000);
+export const creatorProfileCache = new TtlCache<Creator>(5 * 60 * 1000, 500);
+creatorProfileCache.startSweeping();
 
 export function formatCreator<T extends { presetAmounts?: unknown }>(creator: T): T {
   if (!creator) return creator;
@@ -63,7 +65,8 @@ interface SupporterLeaderboardEntry extends LeaderboardEntry {
 // cache/Redis for a single-instance API, while still being fresh within a
 // donation's-eye-view of "shortly after it happened". Exported so tests
 // can reset it between cases instead of sharing state across the file.
-export const leaderboardCache = new TtlCache<{ entries: LeaderboardEntry[]; total: number }>(30_000);
+export const leaderboardCache = new TtlCache<{ entries: LeaderboardEntry[]; total: number }>(30_000, 200);
+leaderboardCache.startSweeping();
 
 const WALLET_TAKEN_MESSAGE = "This wallet address is already linked to another creator profile";
 
@@ -182,7 +185,10 @@ router.get(
     const total = await prisma.creator.count({ where });
 
     return res.json({
-      items: creators.map(formatCreator),
+      items: creators.map((creator) => ({
+        ...toPublicCreator(creator),
+        _count: { donations: creator._count.donations },
+      })),
       pagination: {
         page,
         limit,
@@ -333,7 +339,7 @@ router.get(
         return profile;
       });
 
-      return res.json(formatCreator(creator));
+      return res.json(toPublicCreator(creator));
     } catch (error) {
       // If cache fails, fall back to direct DB read
       if (error instanceof NotFoundError) {
@@ -347,7 +353,7 @@ router.get(
         throw new NotFoundError("Creator not found");
       }
 
-      return res.json(formatCreator(creator));
+      return res.json(toPublicCreator(creator));
     }
   })
 );

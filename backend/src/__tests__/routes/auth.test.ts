@@ -18,6 +18,7 @@ jest.mock("../../services/magicLink", () => ({
 jest.mock("../../services/twitterAuth", () => ({
   startTwitterAuth: jest.fn(),
   completeTwitterAuth: jest.fn(),
+  TWITTER_OAUTH_STATE_TTL_MS: 10 * 60 * 1000,
 }));
 
 import { createHash } from "crypto";
@@ -251,12 +252,19 @@ describe("GET /api/auth/twitter (#14)", () => {
   });
 
   it("returns the redirect URL to start the OAuth flow", async () => {
-    mockedStartTwitterAuth.mockReturnValue("https://twitter.com/i/oauth2/authorize?client_id=x");
+    mockedStartTwitterAuth.mockReturnValue({
+      redirectUrl: "https://twitter.com/i/oauth2/authorize?client_id=x",
+      bindingNonce: "browser-nonce",
+    });
 
     const res = await request(app).get("/api/auth/twitter");
 
     expect(res.status).toBe(200);
     expect(res.body.redirectUrl).toBe("https://twitter.com/i/oauth2/authorize?client_id=x");
+    expect(res.headers["set-cookie"][0]).toContain("twitter_oauth_binding=browser-nonce");
+    expect(res.headers["set-cookie"][0]).toContain("HttpOnly");
+    expect(res.headers["set-cookie"][0]).toContain("SameSite=Lax");
+    expect(res.headers["set-cookie"][0]).toContain("Max-Age=600");
   });
 
   it("returns a 503 when Twitter sign-in is not configured", async () => {
@@ -293,6 +301,7 @@ describe("GET /api/auth/twitter/callback (#14)", () => {
 
     const res = await request(app)
       .get("/api/auth/twitter/callback")
+      .set("Cookie", "twitter_oauth_binding=browser-nonce")
       .query({ code: "auth-code", state: "state-value" });
 
     expect(res.status).toBe(200);
@@ -301,7 +310,8 @@ describe("GET /api/auth/twitter/callback (#14)", () => {
       token: "signed.jwt.token",
       hasProfile: false,
     });
-    expect(mockedCompleteTwitterAuth).toHaveBeenCalledWith("auth-code", "state-value");
+    expect(mockedCompleteTwitterAuth).toHaveBeenCalledWith("auth-code", "state-value", "browser-nonce");
+    expect(res.headers["set-cookie"][0]).toContain("twitter_oauth_binding=;");
   });
 
   it("returns a clear error for an invalid or expired OAuth state", async () => {
@@ -315,16 +325,56 @@ describe("GET /api/auth/twitter/callback (#14)", () => {
       .query({ code: "auth-code", state: "bad-state" });
 
     expect(res.status).toBe(401);
+    expect(mockedCompleteTwitterAuth).toHaveBeenCalledWith("auth-code", "bad-state", undefined);
+    expect(res.headers["set-cookie"][0]).toContain("twitter_oauth_binding=;");
   });
 
-  it("returns a clear error when Twitter denies or the exchange fails", async () => {
-    mockedCompleteTwitterAuth.mockRejectedValue(new Error("Twitter token exchange failed (400): access_denied"));
+  it("passes a mismatched browser-binding cookie to OAuth state validation", async () => {
+    const { UnauthorizedError } = await import("../../errors/AppError");
+    mockedCompleteTwitterAuth.mockRejectedValue(
+      new UnauthorizedError("Invalid or expired OAuth state, please try again")
+    );
+
+    const res = await request(app)
+      .get("/api/auth/twitter/callback")
+      .set("Cookie", "twitter_oauth_binding=wrong-browser")
+      .query({ code: "auth-code", state: "issued-state" });
+
+    expect(res.status).toBe(401);
+    expect(mockedCompleteTwitterAuth).toHaveBeenCalledWith(
+      "auth-code",
+      "issued-state",
+      "wrong-browser"
+    );
+    expect(res.headers["set-cookie"][0]).toContain("twitter_oauth_binding=;");
+  });
+
+  it("returns 502 (not 500) and no provider body when Twitter is unavailable (#438)", async () => {
+    const { BadGatewayError } = await import("../../errors/AppError");
+    mockedCompleteTwitterAuth.mockRejectedValue(
+      new BadGatewayError("Twitter token exchange failed, please try again")
+    );
 
     const res = await request(app)
       .get("/api/auth/twitter/callback")
       .query({ code: "auth-code", state: "state-value" });
 
-    expect(res.status).toBe(500);
+    expect(res.status).toBe(502);
+    expect(res.body.code).toBe("BAD_GATEWAY");
+    expect(JSON.stringify(res.body)).not.toMatch(/access_denied|invalid_grant/);
+  });
+
+  it("returns 401 when Twitter rejects the authorization code (#438)", async () => {
+    const { UnauthorizedError } = await import("../../errors/AppError");
+    mockedCompleteTwitterAuth.mockRejectedValue(
+      new UnauthorizedError("Twitter rejected the token exchange, please try again")
+    );
+
+    const res = await request(app)
+      .get("/api/auth/twitter/callback")
+      .query({ code: "auth-code", state: "state-value" });
+
+    expect(res.status).toBe(401);
   });
 });
 

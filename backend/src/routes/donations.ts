@@ -3,7 +3,11 @@ import { Donation, Goal, Prisma } from "@prisma/client";
 import prisma from "../prisma";
 import { asyncHandler } from "../middleware/asyncHandler";
 import { validate } from "../middleware/validate";
-import { createDonationSchema, listDonationsQuerySchema } from "../schemas/donations";
+import {
+  createDonationSchema,
+  donationTxHashParamSchema,
+  listDonationsQuerySchema,
+} from "../schemas/donations";
 import {
   notifyDonationConfirmation,
   notifyDonationReceived,
@@ -19,6 +23,7 @@ import { RateLimiter } from "../services/rateLimiter";
 import { clientIp, rateLimit } from "../middleware/rateLimit";
 import { getRateLimitConfig } from "../config";
 import { hashDonationRequest } from "../lib/idempotency";
+import { assertCreatorAcceptsCurrency } from "../services/creatorCurrency";
 
 const router = Router();
 const rateLimits = getRateLimitConfig();
@@ -75,6 +80,42 @@ router.get(
     return res.json({
       items: responseItems,
       pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
+    });
+  })
+);
+
+// Public lookup used by the receipt page (#448). Only donations the on-chain
+// listener has corroborated are returned, so a URL cannot turn a client
+// report — or a tampered query string — into a "verified" receipt. The
+// sender address is deliberately omitted: a receipt identifies the donation
+// and its creator, not the supporter's wallet.
+router.get(
+  "/:transactionHash",
+  validate({ params: donationTxHashParamSchema }),
+  asyncHandler(async (req, res) => {
+    const { transactionHash } = req.params;
+
+    const donation = await prisma.donation.findFirst({
+      where: { transactionHash, verified: true },
+      orderBy: { id: "asc" },
+      select: {
+        transactionHash: true,
+        amount: true,
+        currency: true,
+        message: true,
+        createdAt: true,
+        verified: true,
+        creator: {
+          select: { username: true, displayName: true, avatarUrl: true },
+        },
+      },
+    });
+
+    if (!donation) throw new NotFoundError("Donation not found");
+
+    return res.json({
+      ...donation,
+      amount: donation.amount.toString(),
     });
   })
 );
@@ -154,6 +195,7 @@ router.post(
 
       const creator = await client.creator.findUnique({ where: { username: creatorUsername } });
       if (!creator) throw new NotFoundError("Creator not found");
+      assertCreatorAcceptsCurrency(creator, currency);
 
       const donation = await client.donation.upsert({
         where: {
@@ -175,6 +217,7 @@ router.post(
           operationIndex,
           eventIndex,
           verified,
+          currencyAccepted: true,
         },
       });
       await client.donationIdempotencyKey.create({

@@ -68,6 +68,16 @@ function positiveIntegerEnv(name: string, fallback: number): number {
 }
 
 /**
+ * Upper bound, in milliseconds, on a single outbound email provider call
+ * (#530). A stalled Resend connection would otherwise never settle and hold
+ * the awaiting HTTP request or executor tick open indefinitely. Defaults to
+ * 10s; must be a positive integer so a typo cannot disable the bound.
+ */
+export function getEmailSendTimeoutMs(): number {
+  return positiveIntegerEnv("EMAIL_SEND_TIMEOUT_MS", 10_000);
+}
+
+/**
  * Public API throttling settings. These are read when route modules are loaded,
  * so changing them requires the same process restart as every other env setting.
  * Invalid explicit values fail startup instead of silently disabling protection.
@@ -147,6 +157,11 @@ export function validateConfig() {
   }
   try {
     getStellarNetworkName();
+  } catch (err) {
+    invalid.push((err as Error).message);
+  }
+  try {
+    getEmailSendTimeoutMs();
   } catch (err) {
     invalid.push((err as Error).message);
   }

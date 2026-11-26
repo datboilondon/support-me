@@ -29,6 +29,7 @@ jest.mock("../../services/donationNotifications", () => ({
 import { Subscription } from "@prisma/client";
 import prisma from "../../prisma";
 import { SubscriptionExecutor } from "../../services/subscriptionExecutor";
+import { executorHealth } from "../../services/executorHealth";
 import {
   notifySubscriptionPaymentFailed,
   notifySubscriptionRenewed,
@@ -364,6 +365,120 @@ describe("SubscriptionExecutor multi-instance claiming (#394)", () => {
 
     expect(submitCharge).toHaveBeenCalledTimes(1);
     expect(claims.has(subscriptionId)).toBe(false);
+  });
+});
+
+describe("SubscriptionExecutor run health (#500)", () => {
+  const makeSubscription = (id: number) =>
+    ({
+      id,
+      creatorId: id,
+      supporterAddress: `G supporter ${id}`,
+      token: "XLM",
+      amount: 2.5,
+      intervalSecs: 60,
+      onChainId: id,
+      active: true,
+      nextChargeAt: new Date(0),
+      createdAt: new Date(0),
+      updatedAt: new Date(0),
+      lastChargeTxHash: null,
+      lastChargedAt: null,
+      lastError: null,
+      failureCount: 0,
+      failureNotifiedAt: null,
+      subscribeTxHash: null,
+    }) as never;
+
+  function executorWithCharge(submitCharge: jest.Mock): SubscriptionExecutor {
+    const executor = new SubscriptionExecutor();
+    (executor as unknown as { submitCharge: jest.Mock }).submitCharge = submitCharge;
+    return executor;
+  }
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    executorHealth.reset();
+    executorHealth.markEnabled(60_000);
+    mockedPrisma.subscription.updateMany.mockResolvedValue({ count: 1 });
+    mockedPrisma.subscription.update.mockResolvedValue(subscription);
+    mockedPrisma.donation.upsert.mockResolvedValue({ id: 1 });
+    mockedPrisma.$transaction.mockImplementation(
+      async (callback: ((client: typeof mockedPrisma) => Promise<unknown>) | Promise<unknown>[]) => {
+        if (typeof callback === "function") {
+          return callback(mockedPrisma);
+        }
+        return Promise.all(callback);
+      }
+    );
+    mockedRenewed.mockResolvedValue(undefined);
+    mockedPaymentFailed.mockResolvedValue(true);
+    mockedApplyToGoals.mockResolvedValue([]);
+    mockedNotifyGoalsReached.mockResolvedValue(undefined);
+  });
+
+  it("reports unhealthy when every charge in a run fails", async () => {
+    const due = [makeSubscription(1), makeSubscription(2), makeSubscription(3)];
+    mockedPrisma.subscription.findMany.mockResolvedValue(due);
+    const submitCharge = jest
+      .fn()
+      .mockRejectedValue(new Error("Transaction tx failed on-chain"));
+
+    await executorWithCharge(submitCharge).tick();
+
+    const health = executorHealth.getHealth();
+    expect(submitCharge).toHaveBeenCalledTimes(3);
+    expect(health.status).toBe("unhealthy");
+    expect(health.lastRun).toMatchObject({
+      successCount: 0,
+      failureCount: 3,
+      attemptedCount: 3,
+      status: "failed",
+    });
+    expect(health.recentCharges.failureCount).toBe(3);
+  });
+
+  it("reports degraded when only some charges in a run fail", async () => {
+    const due = [makeSubscription(1), makeSubscription(2), makeSubscription(3)];
+    mockedPrisma.subscription.findMany.mockResolvedValue(due);
+    const failingIds = new Set([2, 3]);
+    const submitCharge = jest
+      .fn()
+      .mockImplementation(async (sub: { id: number }) => {
+        if (failingIds.has(sub.id)) {
+          throw new Error("Transaction tx failed on-chain");
+        }
+        return "charge-tx";
+      });
+
+    await executorWithCharge(submitCharge).tick();
+
+    const health = executorHealth.getHealth();
+    expect(health.status).toBe("degraded");
+    expect(health.lastRun).toMatchObject({
+      successCount: 1,
+      failureCount: 2,
+      attemptedCount: 3,
+      status: "degraded",
+    });
+  });
+
+  it("reports ok when every charge in a run succeeds", async () => {
+    const due = [makeSubscription(1), makeSubscription(2), makeSubscription(3)];
+    mockedPrisma.subscription.findMany.mockResolvedValue(due);
+    const submitCharge = jest.fn().mockResolvedValue("charge-tx");
+
+    await executorWithCharge(submitCharge).tick();
+
+    const health = executorHealth.getHealth();
+    expect(health.status).toBe("ok");
+    expect(health.lastRun).toMatchObject({
+      successCount: 3,
+      failureCount: 0,
+      attemptedCount: 3,
+      status: "ok",
+    });
+    expect(health.recentCharges.successCount).toBe(3);
   });
 });
 

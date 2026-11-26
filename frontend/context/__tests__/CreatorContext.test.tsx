@@ -24,8 +24,9 @@ const creator = {
 };
 
 function Probe() {
-  const { creator: c, loading } = useCreator();
+  const { creator: c, loading, error } = useCreator();
   if (loading) return <p>loading</p>;
+  if (error) return <p>error:{error}</p>;
   if (!c) return <p>no creator</p>;
   return (
     <p>
@@ -80,20 +81,20 @@ describe('CreatorProvider (#460)', () => {
     await waitFor(() => expect(screen.getByText('no creator')).toBeInTheDocument());
   });
 
-  it('keeps the previous creator null and stops loading on a server error', async () => {
+  it('exposes an error and stops loading on a 500 server error', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('oops', { status: 500 })));
     renderWithAuth({ user: { id: 3 }, token: 'tok' });
 
-    await waitFor(() => expect(screen.getByText('no creator')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('error:Failed to load your profile')).toBeInTheDocument());
   });
 
-  it('keeps the creator null and stops loading when the fetch throws', async () => {
+  it('exposes an error and stops loading when the fetch throws', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => {
       throw new Error('network down');
     }));
     renderWithAuth({ user: { id: 3 }, token: 'tok' });
 
-    await waitFor(() => expect(screen.getByText('no creator')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('error:network down')).toBeInTheDocument());
   });
 
   it('refetches when invalidate is called', async () => {

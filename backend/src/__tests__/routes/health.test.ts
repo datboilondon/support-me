@@ -119,6 +119,47 @@ describe("GET /health", () => {
     expect(executor.recentCharges.failureCount).toBe(0);
   });
 
+  it("reports degraded when most charges in the executor's last run failed (#500)", async () => {
+    executorHealth.markEnabled(60_000);
+    executorHealth.runStarted();
+    executorHealth.recordCharge(1, "success");
+    executorHealth.recordCharge(2, "failure", "allowance revoked");
+    executorHealth.recordCharge(3, "failure", "allowance revoked");
+    executorHealth.runFinished(true);
+
+    const publicRes = await request(app).get("/health");
+    expect(publicRes.body).toEqual({ status: "degraded" });
+
+    const res = await detail();
+    expect(res.body.status).toBe("degraded");
+    expect(res.body.dependencies.subscriptionExecutor.status).toBe("degraded");
+    expect(res.body.dependencies.subscriptionExecutor.lastRun).toMatchObject({
+      successCount: 1,
+      failureCount: 2,
+      attemptedCount: 3,
+    });
+  });
+
+  it("reports unhealthy when every charge in the executor's last run failed (#500)", async () => {
+    executorHealth.markEnabled(60_000);
+    executorHealth.runStarted();
+    executorHealth.recordCharge(1, "failure", "insufficient balance");
+    executorHealth.recordCharge(2, "failure", "insufficient balance");
+    executorHealth.runFinished(true);
+
+    const publicRes = await request(app).get("/health");
+    expect(publicRes.body).toEqual({ status: "unhealthy" });
+
+    const res = await detail();
+    expect(res.body.status).toBe("unhealthy");
+    expect(res.body.dependencies.subscriptionExecutor.status).toBe("unhealthy");
+    expect(res.body.dependencies.subscriptionExecutor.lastRun).toMatchObject({
+      successCount: 0,
+      failureCount: 2,
+      status: "failed",
+    });
+  });
+
   it("reports an unhealthy overall status when the executor has stalled", async () => {
     executorHealth.markEnabled(60_000);
     executorHealth.runFinished(true, undefined, Date.now() - 5 * 60_000);
@@ -199,6 +240,20 @@ describe("GET /health/executor (#440)", () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ status: "unhealthy" });
+  });
+
+  it("passes a degraded executor status through publicly (#500)", async () => {
+    executorHealth.markEnabled(60_000);
+    executorHealth.runStarted();
+    executorHealth.recordCharge(1, "success");
+    executorHealth.recordCharge(2, "failure", "allowance revoked");
+    executorHealth.recordCharge(3, "failure", "allowance revoked");
+    executorHealth.runFinished(true);
+
+    const res = await request(app).get("/health/executor");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ status: "degraded" });
   });
 
   it("reports disabled publicly when the executor was never started", async () => {

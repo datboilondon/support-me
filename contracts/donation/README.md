@@ -242,8 +242,9 @@ Code 9 is not used.
 
 1. **Authentication**: All state-changing operations require auth
 2. **Validation**: Amounts must be positive
-3. **Creator Flexibility**: Creators don't need to pre-register to receive donations
-4. **Immutability**: All donation records are immutable once recorded
+3. **No self-donations**: `donate` and `subscribe` reject calls where the donor/supporter address equals the creator address (`DonationError::SelfDonation`). This prevents a creator from inflating their own registry stats and leaderboard standing at the cost of only the network fee.
+4. **Creator Flexibility**: Creators don't need to pre-register to receive donations
+5. **Immutability**: All donation records are immutable once recorded
 
 ## Deployment and initialization
 

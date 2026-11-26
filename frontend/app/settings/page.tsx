@@ -21,6 +21,7 @@ import { AccountDataSection } from '@/components/AccountDataSection';
 import { ThemeEditor } from '@/components/ThemeEditor';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { explorerAccountUrl } from '@/lib/stellarNetwork';
+import { formatAmount } from '@/lib/format';
 
 interface Goal {
   id: number;
@@ -52,7 +53,7 @@ const parseGoalTarget = (value: string): number | null => {
 
 export default function SettingsPage() {
   const { user, token } = useAuth();
-  const { creator, loading: creatorLoading, invalidate } = useCreator();
+  const { creator, loading: creatorLoading, error: creatorError, invalidate } = useCreator();
   const [saving, setSaving] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [dirty, setDirty] = useState(false);
@@ -404,6 +405,27 @@ export default function SettingsPage() {
     );
   }
 
+  if (!creator && creatorError) {
+    return (
+      <ProtectedRoute>
+        <div className="min-h-screen bg-background">
+          <AppNav />
+          <div className="max-w-2xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
+            <div className="card-brutal p-8 text-center mb-6">
+              <p className="text-muted mb-4 font-medium">{creatorError}</p>
+              <button type="button" onClick={invalidate} className="btn-brutal btn-brutal-primary">
+                Retry
+              </button>
+            </div>
+            <div className="card-brutal p-8">
+              <AccountDataSection />
+            </div>
+          </div>
+        </div>
+      </ProtectedRoute>
+    );
+  }
+
   if (!creator) {
     return (
       <ProtectedRoute>
@@ -708,7 +730,7 @@ export default function SettingsPage() {
                               <p className="text-sm text-ink/80 font-medium">{g.description}</p>
                             )}
                             <p className="text-sm text-muted font-medium">
-                              {g.currentAmount.toFixed(0)} / {g.targetAmount.toFixed(0)} {g.currency} ({pct.toFixed(0)}%)
+                              {formatAmount(g.currentAmount)} / {formatAmount(g.targetAmount)} {g.currency} ({pct.toFixed(0)}%)
                             </p>
                           </div>
                           <div className="flex gap-2 shrink-0">
@@ -921,7 +943,7 @@ function GoalSummary({ goal }: { goal: Goal }) {
   return (
     <div className="card-brutal bg-card p-4 space-y-2">
       <p className="text-sm font-bold text-ink">
-        {goal.currentAmount.toFixed(0)} / {goal.targetAmount.toFixed(0)} {goal.currency} raised ({pct.toFixed(0)}%)
+        {formatAmount(goal.currentAmount)} / {formatAmount(goal.targetAmount)} {goal.currency} raised ({pct.toFixed(0)}%)
       </p>
       <div
         className="h-3 w-full border-2 border-ink rounded-full overflow-hidden bg-background"

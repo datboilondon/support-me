@@ -107,6 +107,54 @@ describe("POST /api/subscriptions", () => {
     "GBLOPB74SBZC2O24XTYSW4UOJ5LPQXUENXQK53RJUO5GYZIKTQ7OB365"
   );
 
+  it.each([
+    ["XLM", { acceptsXlm: false, acceptsUsdc: true, acceptsUsdt: true }, "USDC, USDT"],
+    ["USDC", { acceptsXlm: true, acceptsUsdc: false, acceptsUsdt: true }, "XLM, USDT"],
+    ["USDT", { acceptsXlm: true, acceptsUsdc: true, acceptsUsdt: false }, "XLM, USDC"],
+  ])("rejects %s when the creator has disabled it", async (currency, preferences, allowed) => {
+    mockedPrisma.creator.findUnique.mockResolvedValue({
+      id: 7,
+      userId: 2,
+      username: "bob",
+      ...preferences,
+    });
+
+    const res = await request(app)
+      .post("/api/subscriptions")
+      .set("Authorization", `Bearer ${token}`)
+      .send({
+        creatorUsername: "bob",
+        supporterAddress: SUPPORTER,
+        token: currency,
+        amount: 10,
+        intervalSecs: 2592000,
+        onChainId: 0,
+      });
+
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("BAD_REQUEST");
+    expect(res.body.error).toContain(`Allowed currencies: ${allowed}`);
+    expect(mockedPrisma.subscription.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unknown currency code", async () => {
+    const res = await request(app)
+      .post("/api/subscriptions")
+      .set("Authorization", `Bearer ${token}`)
+      .send({
+        creatorUsername: "bob",
+        supporterAddress: SUPPORTER,
+        token: "DOGE",
+        amount: 10,
+        intervalSecs: 2592000,
+        onChainId: 0,
+      });
+
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("VALIDATION_ERROR");
+    expect(mockedPrisma.creator.findUnique).not.toHaveBeenCalled();
+  });
+
   it("rejects requests without an auth token", async () => {
     const res = await request(app).post("/api/subscriptions").send({
       creatorUsername: "bob",

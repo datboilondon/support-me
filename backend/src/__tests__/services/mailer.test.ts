@@ -23,16 +23,23 @@ const message = { to: "supporter@example.com", subject: "Hello", html: "<p>hi</p
 describe("sendEmail", () => {
   const originalFetch = global.fetch;
   const originalApiKey = process.env.RESEND_API_KEY;
+  const originalTimeout = process.env.EMAIL_SEND_TIMEOUT_MS;
 
   beforeEach(() => {
     mockedPrisma.emailEvent.findFirst.mockResolvedValue(null);
     mockedPrisma.emailEvent.create.mockResolvedValue({});
     process.env.RESEND_API_KEY = "test-key";
+    delete process.env.EMAIL_SEND_TIMEOUT_MS;
   });
 
   afterEach(() => {
     global.fetch = originalFetch;
     process.env.RESEND_API_KEY = originalApiKey;
+    if (originalTimeout === undefined) {
+      delete process.env.EMAIL_SEND_TIMEOUT_MS;
+    } else {
+      process.env.EMAIL_SEND_TIMEOUT_MS = originalTimeout;
+    }
   });
 
   it("records a SENT event with the provider message id on success", async () => {
@@ -108,11 +115,71 @@ describe("sendEmail", () => {
     expect(mockedPrisma.emailEvent.findFirst).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({
-          recipient: message.to,
+          recipient: { equals: message.to, mode: "insensitive" },
           type: { in: ["BOUNCED", "COMPLAINED"] },
         }),
       })
     );
+  });
+
+  it("suppresses a mixed-case address case-insensitively (#534)", async () => {
+    mockedPrisma.emailEvent.findFirst.mockResolvedValue({ id: 1 });
+    global.fetch = jest.fn() as unknown as typeof fetch;
+
+    await sendEmail({ ...message, to: "  Bob@Example.COM " });
+
+    expect(mockedPrisma.emailEvent.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          recipient: { equals: "bob@example.com", mode: "insensitive" },
+        }),
+      })
+    );
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("normalizes the recipient to lowercase when recording events (#534)", async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "resend-789" }),
+    }) as unknown as typeof fetch;
+
+    await sendEmail({ ...message, to: "Bob@Example.COM" });
+
+    expect(global.fetch).toHaveBeenCalledWith(
+      "https://api.resend.com/emails",
+      expect.objectContaining({ body: expect.stringContaining('"to":["bob@example.com"]') })
+    );
+    expect(mockedPrisma.emailEvent.create).toHaveBeenCalledWith({
+      data: {
+        recipient: "bob@example.com",
+        subject: message.subject,
+        type: "SENT",
+        providerMessageId: "resend-789",
+      },
+    });
+  });
+
+  it("aborts a hung provider call within the configured timeout and records a FAILED event (#530)", async () => {
+    process.env.EMAIL_SEND_TIMEOUT_MS = "25";
+    global.fetch = jest.fn(
+      (_url: unknown, init?: { signal?: AbortSignal }) =>
+        new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          signal?.addEventListener("abort", () => reject(signal?.reason));
+        })
+    ) as unknown as typeof fetch;
+
+    await expect(sendEmail(message)).rejects.toThrow("Email provider request timed out after 25ms");
+
+    expect(mockedPrisma.emailEvent.create).toHaveBeenCalledWith({
+      data: {
+        recipient: message.to,
+        subject: message.subject,
+        type: "FAILED",
+        errorDetail: "Email provider request timed out after 25ms",
+      },
+    });
   });
 
   it("logs instead of sending when RESEND_API_KEY is unset", async () => {

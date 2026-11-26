@@ -8,6 +8,7 @@ import { metadata as adminMeta } from '@/app/admin/layout';
 import { metadata as activityMeta } from '@/app/activity/layout';
 import { metadata as appMeta } from '@/app/app/layout';
 import { metadata as authMeta } from '@/app/auth/layout';
+import { metadata as receiptMeta } from '@/app/receipt/layout';
 import { metadata as rootMeta } from '@/app/layout';
 import { metadata as discoverMeta } from '@/app/discover/layout';
 import { metadata as leaderboardMeta } from '@/app/leaderboard/layout';
@@ -35,6 +36,7 @@ describe('SEO & Robots Directives', () => {
       { name: 'activity', meta: activityMeta },
       { name: 'app', meta: appMeta },
       { name: 'auth', meta: authMeta },
+      { name: 'receipt', meta: receiptMeta },
     ];
 
     layouts.forEach(({ name, meta }) => {

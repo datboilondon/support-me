@@ -1,4 +1,4 @@
-import { Router, Response } from 'express';
+import { Router, Request, Response } from 'express';
 import { randomBytes, createHash } from 'crypto';
 import { Keypair } from '@stellar/stellar-sdk';
 import prisma from '../prisma';
@@ -14,7 +14,11 @@ import {
 } from '../schemas/auth';
 import { UnauthorizedError } from '../errors/AppError';
 import { requestMagicLink, verifyMagicLink } from '../services/magicLink';
-import { completeTwitterAuth, startTwitterAuth } from '../services/twitterAuth';
+import {
+  completeTwitterAuth,
+  startTwitterAuth,
+  TWITTER_OAUTH_STATE_TTL_MS,
+} from '../services/twitterAuth';
 import { ChallengeStore } from '../services/challengeStore';
 import { RateLimiter } from '../services/rateLimiter';
 import { clientIp, rateLimit } from '../middleware/rateLimit';
@@ -23,6 +27,34 @@ import { getRateLimitConfig } from '../config';
 const router = Router();
 
 export const AUTH_COOKIE_NAME = 'token';
+const TWITTER_OAUTH_BINDING_COOKIE_NAME = 'twitter_oauth_binding';
+
+function setTwitterOAuthBindingCookie(res: Response, nonce: string): void {
+  res.cookie(TWITTER_OAUTH_BINDING_COOKIE_NAME, nonce, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: TWITTER_OAUTH_STATE_TTL_MS,
+    path: '/',
+  });
+}
+
+function clearTwitterOAuthBindingCookie(res: Response): void {
+  res.clearCookie(TWITTER_OAUTH_BINDING_COOKIE_NAME, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+  });
+}
+
+function getTwitterOAuthBindingCookie(req: Request): string | undefined {
+  const cookie = req.headers.cookie
+    ?.split(';')
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(`${TWITTER_OAUTH_BINDING_COOKIE_NAME}=`));
+  return cookie?.slice(TWITTER_OAUTH_BINDING_COOKIE_NAME.length + 1);
+}
 
 export function setAuthCookie(res: Response, token: string): void {
   const isProd = process.env.NODE_ENV === 'production';
@@ -86,6 +118,23 @@ export const magicLinkEmailLimiter = new RateLimiter(
   rateLimits.magicLink.windowMs
 );
 magicLinkEmailLimiter.startSweeping();
+
+// Per-IP limits on both Twitter OAuth endpoints (#438). The start endpoint
+// adds a pending PKCE state per call, and the callback spends a provider
+// round-trip and an account lookup, so an unauthenticated caller must not be
+// able to drive either one flat out. Separate limiters because a real sign-in
+// is one start and one callback, and flagging a user out of starting because
+// callbacks were retried would be unhelpful.
+export const twitterStartIpLimiter = new RateLimiter(
+  rateLimits.auth.ipMax,
+  rateLimits.auth.windowMs
+);
+twitterStartIpLimiter.startSweeping();
+export const twitterCallbackIpLimiter = new RateLimiter(
+  rateLimits.auth.ipMax,
+  rateLimits.auth.windowMs
+);
+twitterCallbackIpLimiter.startSweeping();
 
 router.post(
   '/challenge',
@@ -220,19 +269,26 @@ router.post(
 // /twitter/callback once Twitter redirects back with a code.
 router.get(
   '/twitter',
+  rateLimit(twitterStartIpLimiter, clientIp, 'Twitter sign-in'),
   asyncHandler(async (req, res) => {
-    const redirectUrl = startTwitterAuth();
+    const { redirectUrl, bindingNonce } = startTwitterAuth();
+    setTwitterOAuthBindingCookie(res, bindingNonce);
     return res.json({ redirectUrl });
   })
 );
 
 router.get(
   '/twitter/callback',
+  (req, res, next) => {
+    clearTwitterOAuthBindingCookie(res);
+    next();
+  },
+  rateLimit(twitterCallbackIpLimiter, clientIp, 'Twitter sign-in'),
   validate({ query: twitterCallbackSchema }),
   asyncHandler(async (req, res) => {
     const { code, state } = req.query as unknown as { code: string; state: string };
 
-    const session = await completeTwitterAuth(code, state);
+    const session = await completeTwitterAuth(code, state, getTwitterOAuthBindingCookie(req));
     setAuthCookie(res, session.token);
 
     return res.json(session);

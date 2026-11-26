@@ -20,14 +20,13 @@ const CHECK_INTERVAL_MS = Number(process.env.GOAL_RESET_CHECK_INTERVAL_MS) || 60
  *     here coordinates leadership across instances.
  *   - If the backend process is down when a goal's period technically ends,
  *     the reset simply happens late, on the first tick after the process
- *     next starts (or the next scheduled tick) — there's no catch-up backlog
- *     tracking beyond "was currentPeriodEnd in the past when we checked".
- *     For a monthly/weekly cadence this is an acceptable approximation
- *     rather than a hard guarantee of firing at the exact instant.
+ *     next starts (or the next scheduled tick). Periods missed in the
+ *     meantime are skipped over: the next `currentPeriodEnd` is the first
+ *     interval boundary after the reset, counted from the previous end.
  *   - The check interval (default hourly, `GOAL_RESET_CHECK_INTERVAL_MS`)
  *     trades timing precision for simplicity: a goal can reset up to one
- *     interval late. Given resets happen on a weekly/monthly cadence, being
- *     off by up to an hour is not significant in practice.
+ *     interval late. The schedule itself doesn't drift, though — each new
+ *     period end is computed from the previous end, not the tick time.
  */
 export class GoalResetScheduler {
   private timer: ReturnType<typeof setInterval> | null = null;

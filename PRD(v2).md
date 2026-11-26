@@ -235,6 +235,8 @@ Fields:
 
 # 6.7 Multiple Currency Support
 
+**Status:** Shipped for XLM, USDC and USDT. Custom tokens and fiat/cross-chain payments are planned.
+
 Supported currencies:
 
 - XLM
@@ -250,6 +252,8 @@ Future:
 ---
 
 # 6.8 Donation Goal
+
+**Status:** Shipped.
 
 Creators can set a funding goal.
 
@@ -271,6 +275,8 @@ Progress:
 
 # 6.9 Recent Supporters Feed
 
+**Status:** Shipped.
+
 Display recent donations.
 
 Example:
@@ -283,11 +289,14 @@ John sent 3 XLM
 
 # 6.10 Notifications
 
+**Status:** Partly shipped. Email notices for a received donation and a reached goal are implemented, and in-app toast notifications exist. Large-donation alerts and push notifications are planned (no implementation exists).
+
 Creators receive notifications when:
 
 - a donation is received
 - a large donation occurs
 - a goal is reached
+
 
 ---
 
@@ -301,6 +310,8 @@ Creators receive notifications when:
 
 # 6.11 QR Code Generator
 
+**Status:** Shipped.
+
 Automatically generate a QR code for the creator’s page.
 
 Capabilities:
@@ -312,6 +323,8 @@ Capabilities:
 ---
 
 # 6.12 Tip Presets
+
+**Status:** Shipped.
 
 Provide quick payment buttons.
 
@@ -326,6 +339,8 @@ Custom
 
 # 6.13 Custom Themes
 
+**Status:** Shipped.
+
 Creators can customize their page.
 
 Options:
@@ -338,6 +353,8 @@ Options:
 ---
 
 # 6.14 Leaderboard
+
+**Status:** Shipped.
 
 Display top supporters.
 
@@ -353,15 +370,126 @@ Top communities
 
 ---
 
+This section mirrors [`backend/prisma/schema.prisma`](backend/prisma/schema.prisma),
+which is the source of truth. If the two disagree, the schema wins.
+
+## User
+
+```
+id, walletAddress (unique, nullable), email (unique, nullable),
+createdAt, updatedAt, deletedAt (nullable)
+```
+
+`walletAddress` is null for magic-link and OAuth accounts until a wallet is
+connected. `deletedAt` marks an account anonymized through account deletion.
+
+## OAuthIdentity
+
+```
+id, provider, providerAccountId, userId (foreign key),
+accessToken (nullable), refreshToken (nullable), createdAt, updatedAt
+```
+
+Unique on `(provider, providerAccountId)`.
+
+## MagicLinkToken
+
+```
+id, tokenHash (unique), email, userId (nullable foreign key),
+expiresAt, usedAt (nullable), createdAt
+```
+
+
+Only the SHA-256 hash of the token is stored.
+
+## AdminAuditLog
+
+```
+id, adminId (nullable foreign key), adminWalletAddress, action,
+targetType, targetId, before (JSON, nullable), after (JSON, nullable),
+requestId (nullable), createdAt
+```
+
 ## Creator
 
-```sql
-id
-username
-walletAddress
-displayName
-bio
-avatarUrl
-coverImage
-createdAt
-updatedAt
+```
+id, userId (foreign key, unique), username (unique), walletAddress (nullable),
+displayName, bio, avatarUrl, socialLinks (JSON),
+acceptsXlm (default: true), acceptsUsdc (default: true),
+acceptsUsdt (default: false),
+presetAmounts (Decimal[], default: empty), theme (JSON, nullable),
+donationGoal (deprecated, see Goal), createdAt, updatedAt
+```
+
+A connected `walletAddress` is unique across creators.
+
+> **Not implemented:** `coverImage`. An earlier version of this document listed a
+> cover image on the creator profile, but no such field exists in the schema.
+
+## Donation
+
+```
+id, creatorId (foreign key), senderAddress, amount (Decimal),
+currency (default: "XLM"), message, transactionHash,
+
+onChainEventId (unique), rpcEventId (unique),
+operationIndex (default: 0), eventIndex (default: 0),
+verified (default: true), createdAt
+```
+
+Unique on `(transactionHash, operationIndex, eventIndex)`.
+
+## DonationIdempotencyKey
+
+```
+key (primary key), donationId (foreign key, unique), expiresAt,
+createdAt, requestHash (nullable)
+```
+
+## Withdrawal
+
+```
+id, creatorId (foreign key), amountIn (Decimal), amountOut (Decimal, nullable),
+fee (Decimal, nullable), currency (default: "USDC"), anchorTxId,
+stellarTxId (nullable), status (default: "completed"),
+verified (default: false), createdAt
+```
+
+Unique on `(creatorId, anchorTxId)`.
+
+## Goal
+
+```
+id, creatorId (foreign key), title, description, targetAmount (Decimal),
+currentAmount (Decimal, default: 0), currency (default: "XLM"),
+status (ACTIVE | COMPLETED | EXPIRED, default: ACTIVE),
+recurring (default: false), recurrenceInterval (WEEKLY | MONTHLY, nullable),
+
+currentPeriodEnd (nullable), createdAt, updatedAt
+```
+
+## Subscription
+
+```
+id, creatorId (foreign key), supporterAddress, token, amount (Decimal),
+intervalSecs, onChainId (unique), subscribeTxHash, nextChargeAt,
+active (default: true), lastChargeTxHash, lastChargedAt, lastError,
+failureCount (default: 0), failureNotifiedAt, claimedAt, claimedBy,
+createdAt, updatedAt
+```
+
+## EmailEvent
+
+```
+id, recipient, subject, type (SENT | DELIVERED | BOUNCED | COMPLAINED | FAILED),
+providerMessageId (nullable), errorDetail (nullable), createdAt
+```
+
+## NetworkCheckpoint
+
+```
+key (primary key), value, updatedAt
+```
+
+Holds operational state that must survive restarts, such as the last Soroban
+ledger sequence the backend observed.

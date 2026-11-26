@@ -18,6 +18,7 @@ function fakeDonation(overrides: Partial<Donation> & Pick<Donation, "id" | "crea
     operationIndex: 0,
     eventIndex: 0,
     verified: true,
+    currencyAccepted: true,
     createdAt: new Date("2026-04-01T12:00:00Z"),
     ...overrides,
   };

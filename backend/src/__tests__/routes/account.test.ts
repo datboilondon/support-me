@@ -31,10 +31,12 @@ jest.mock("../../prisma", () => ({
 
 import request from "supertest";
 import { Prisma } from "@prisma/client";
+import { EventEmitter } from "events";
+import type { Request, Response } from "express";
 import app from "../../app";
 import prisma from "../../prisma";
 import { generateToken } from "../../middleware/auth";
-import { exportRateLimiter, BATCH_SIZE } from "../../routes/account";
+import { exportRateLimiter, BATCH_SIZE, streamBatchedArray } from "../../routes/account";
 
 const mockedPrisma = prisma as unknown as {
   user: { findUnique: jest.Mock; update: jest.Mock };
@@ -201,6 +203,81 @@ describe("GET /api/account/export", () => {
       })
     );
     expect(res.body.donations.sent).toHaveLength(BATCH_SIZE + 1);
+  });
+
+  it("aborts the export when a mid-stream query fails", async () => {
+    mockedPrisma.user.findUnique.mockResolvedValue({
+      id: 1,
+      walletAddress: "GACCOUNTUSERADDRESS",
+      email: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      deletedAt: null,
+      creator: null,
+    });
+    mockedPrisma.donation.findMany
+      .mockResolvedValueOnce(
+        Array.from({ length: BATCH_SIZE }, (_, i) => ({
+          id: BATCH_SIZE - i,
+          senderAddress: "GACCOUNTUSERADDRESS",
+          amount: 5,
+        }))
+      )
+      .mockRejectedValueOnce(new Error("database unavailable"));
+
+    let response: request.Response | undefined;
+    let requestError: unknown;
+    try {
+      response = await request(app)
+        .get("/api/account/export")
+        .set("Authorization", `Bearer ${token}`);
+    } catch (error) {
+      requestError = error;
+    }
+
+    expect(requestError || response).toBeDefined();
+    if (response) {
+      expect(() => JSON.parse(response.text)).toThrow();
+    }
+    expect(mockedPrisma.donation.findMany).toHaveBeenCalled();
+  });
+
+  it("stops batch queries when the request closes", async () => {
+    const req = Object.assign(new EventEmitter(), { aborted: false }) as unknown as Request;
+    const res = Object.assign(new EventEmitter(), {
+      closed: false,
+      destroyed: false,
+      write: jest.fn(() => false),
+    }) as unknown as Response;
+    const fetchBatch = jest.fn().mockResolvedValue([{ id: 1 }]);
+
+    const streaming = streamBatchedArray(res, fetchBatch, 1, req);
+    req.emit("close");
+
+    await expect(streaming).resolves.toBe(false);
+    expect(fetchBatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits for drain before continuing batches", async () => {
+    const req = Object.assign(new EventEmitter(), { aborted: false }) as unknown as Request;
+    const res = Object.assign(new EventEmitter(), {
+      closed: false,
+      destroyed: false,
+      write: jest.fn(() => false),
+    }) as unknown as Response;
+    const fetchBatch = jest
+      .fn()
+      .mockResolvedValueOnce([{ id: 2 }])
+      .mockResolvedValueOnce([]);
+
+    const streaming = streamBatchedArray(res, fetchBatch, 1, req);
+    await new Promise((resolve) => setImmediate(resolve));
+    res.emit("drain");
+    await new Promise((resolve) => setImmediate(resolve));
+    res.emit("drain");
+
+    await expect(streaming).resolves.toBe(true);
+    expect(fetchBatch).toHaveBeenCalledTimes(2);
   });
 });
 

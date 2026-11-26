@@ -22,6 +22,7 @@ import { executorHealth } from "./services/executorHealth";
 import { eventListenerHealth } from "./services/eventListenerHealth";
 import { networkReset } from "./services/networkReset";
 import { getAllowedOrigins, getRateLimitConfig, getTrustProxy } from "./config";
+import { log } from "./lib/logger";
 import { TtlCache } from "./services/ttlCache";
 import { RateLimiter } from "./services/rateLimiter";
 import { clientIp, rateLimit } from "./middleware/rateLimit";
@@ -46,23 +47,41 @@ const app = express();
  * probes) is allowed through: the browser always sends Origin on a
  * cross-origin request, so its absence cannot be attacker-controlled from
  * a page.
+ *
+ * A disallowed origin is a policy outcome, not a server fault (#518). The
+ * origin callback resolves to `false`, so `cors` simply omits the
+ * Access-Control headers and the request is handled like any other non-CORS
+ * request; the browser discards the response. Raising an error here used to
+ * surface as a 500 and a Sentry event for every bot, scanner or preview
+ * deployment that sent an unlisted Origin, which hid real failures and
+ * inflated the error-rate alerts.
  */
-const corsOptions: cors.CorsOptions = {
-  origin(origin, callback) {
-    // Same-origin and non-browser callers send no Origin header.
-    if (!origin) return callback(null, true);
+function isOriginAllowed(origin: string): boolean {
+  return getAllowedOrigins().includes(origin.replace(/\/$/, ""));
+}
 
-    const allowed = getAllowedOrigins();
-    if (allowed.includes(origin.replace(/\/$/, ""))) {
-      return callback(null, true);
-    }
-    // Returning an error rejects the request without echoing the
-    // untrusted origin back in Access-Control-Allow-Origin.
-    return callback(new Error(`Origin not allowed by CORS: ${origin}`));
-  },
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "Idempotency-Key"],
+// Built per request so a rejected origin can log the request id alongside the
+// origin (#518), while the allowlist is still read from the environment on
+// every call rather than frozen at import.
+function corsOptionsFor(req: Request): cors.CorsOptions {
+  return {
+    origin(origin, callback) {
+      // Same-origin and non-browser callers send no Origin header.
+      if (!origin) return callback(null, true);
+      if (isOriginAllowed(origin)) return callback(null, true);
+      // `false` (rather than an Error) makes `cors` drop the headers without
+      // echoing the untrusted origin, and keeps this out of errorHandler.
+      log("warn", "cors origin rejected", { requestId: req.requestId, origin });
+      return callback(null, false);
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "Idempotency-Key"],
+  };
+}
+
+const corsOptionsDelegate: cors.CorsOptionsDelegate<Request> = (req, callback) => {
+  callback(null, corsOptionsFor(req));
 };
 
 // Initialize Sentry if DSN is configured
@@ -85,7 +104,7 @@ if (trustProxy !== undefined) {
 }
 
 app.use(requestLogger);
-app.use(cors(corsOptions));
+app.use(cors(corsOptionsDelegate));
 
 // Mounted with express.raw() ahead of the global express.json() below: Svix
 // signature verification (see routes/emailWebhooks.ts) needs the exact raw
@@ -93,7 +112,16 @@ app.use(cors(corsOptions));
 // re-serialized (and could byte-for-byte differ from what Resend signed).
 app.use("/api/webhooks/email", express.raw({ type: "application/json" }), emailWebhooksRouter);
 
-app.use(express.json());
+/**
+ * JSON bodies are capped deliberately at 100kb (#519) instead of inheriting
+ * body-parser's default, so the limit is visible in one place and documented
+ * in docs/CONFIGURATION.md. Over-limit requests are answered with a 413
+ * PAYLOAD_TOO_LARGE by errorHandler; email webhooks use express.raw() above
+ * and are verified against the exact bytes they received.
+ */
+const JSON_BODY_LIMIT = "100kb";
+
+app.use(express.json({ limit: JSON_BODY_LIMIT }));
 
 // SEO routes (standard paths: /sitemap.xml, /robots.txt)
 app.use("/", seoRouter);
@@ -147,11 +175,13 @@ app.get("/health", healthRateLimit, async (req, res) => {
       ? "unhealthy"
       : subscriptionExecutor.status === "unhealthy"
         ? "unhealthy"
-        : sorobanRpc.status !== "ok"
+        : subscriptionExecutor.status === "degraded"
           ? "degraded"
-          : eventListener.gapDetected
+          : sorobanRpc.status !== "ok"
             ? "degraded"
-            : "ok";
+            : eventListener.gapDetected
+              ? "degraded"
+              : "ok";
   // Public liveness stays minimal. The dependency breakdown (including the
   // listener cursor and reset reason) is only for authorized operators (#440).
   if (!hasHealthDetailAccess(req)) return res.json({ status });
@@ -165,7 +195,10 @@ app.get("/health", healthRateLimit, async (req, res) => {
 
 app.get("/health/executor", healthRateLimit, (req, res) => {
   const subscriptionExecutor = executorHealth.getHealth();
-  const status = subscriptionExecutor.status === "unhealthy" ? "unhealthy" : "ok";
+  // `disabled` stays `ok` for backward compatibility; `degraded` and
+  // `unhealthy` are passed through so monitors see a run whose charges are
+  // mostly or entirely failing (#500).
+  const status = subscriptionExecutor.status === "disabled" ? "ok" : subscriptionExecutor.status;
   // Unauthenticated callers get only the aggregate status. Balances, error
   // strings and subscription ids require the operator detail secret (#440).
   if (!hasHealthDetailAccess(req)) return res.json({ status });

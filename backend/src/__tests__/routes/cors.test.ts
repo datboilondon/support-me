@@ -6,9 +6,17 @@ jest.mock("../../prisma", () => ({
   },
 }));
 
+jest.mock("@sentry/node", () => ({
+  init: jest.fn(),
+  captureException: jest.fn(),
+  captureMessage: jest.fn(),
+}));
+
 import request from "supertest";
+import * as Sentry from "@sentry/node";
 import app from "../../app";
 import { generateToken } from "../../middleware/auth";
+import * as logger from "../../lib/logger";
 
 const PRODUCTION_ORIGIN = "https://support-mee.vercel.app";
 const EVIL_ORIGIN = "https://attacker.example";
@@ -77,5 +85,71 @@ describe("CORS allowlist (#179)", () => {
 
     expect(res.status).toBe(200);
     expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+  });
+
+  describe("a disallowed origin is rejected without becoming a server error (#518)", () => {
+    let logSpy: jest.SpyInstance;
+
+    beforeEach(() => {
+      // The logger is the single funnel every middleware shares, so spying on
+      // it lets us assert both the one warn line and the absence of the old
+      // `unhandled error` line without touching stdout.
+      logSpy = jest.spyOn(logger, "log").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      logSpy.mockRestore();
+    });
+
+    const rejectedOriginLogs = () =>
+      logSpy.mock.calls.filter(([, message]) => message === "cors origin rejected");
+
+    it("answers a disallowed-origin preflight without a 500, Sentry event or error log", async () => {
+      const res = await request(app)
+        .options("/api/subscriptions")
+        .set("Origin", EVIL_ORIGIN)
+        .set("Access-Control-Request-Method", "GET");
+
+      // `cors` drops the grant and Express answers the OPTIONS request itself;
+      // the browser still blocks the call because no allow-origin header is set.
+      expect(res.status).toBe(200);
+      expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+      expect(Sentry.captureException).not.toHaveBeenCalled();
+      expect(logSpy.mock.calls.some(([level]) => level === "error")).toBe(false);
+
+      const rejected = rejectedOriginLogs();
+      expect(rejected).toHaveLength(1);
+      // The warn line is correlatable to the response via the request id.
+      expect(rejected[0][2]).toEqual(
+        expect.objectContaining({ origin: EVIL_ORIGIN, requestId: res.headers["x-request-id"] })
+      );
+      expect(res.headers["x-request-id"]).toBeTruthy();
+    });
+
+    it("processes a disallowed-origin GET without a 500 or Sentry event", async () => {
+      const res = await request(app)
+        .get("/api/subscriptions")
+        .set("Origin", EVIL_ORIGIN)
+        .set("Authorization", `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+      expect(Sentry.captureException).not.toHaveBeenCalled();
+      expect(
+        logSpy.mock.calls.some(([level, message]) => level === "error" && message === "unhandled error")
+      ).toBe(false);
+      expect(rejectedOriginLogs()).toHaveLength(1);
+    });
+
+    it("stays quiet for an allowlisted origin", async () => {
+      const res = await request(app)
+        .options("/api/subscriptions")
+        .set("Origin", PRODUCTION_ORIGIN)
+        .set("Access-Control-Request-Method", "GET");
+
+      expect(res.status).toBeLessThan(400);
+      expect(res.headers["access-control-allow-origin"]).toBe(PRODUCTION_ORIGIN);
+      expect(rejectedOriginLogs()).toHaveLength(0);
+    });
   });
 });

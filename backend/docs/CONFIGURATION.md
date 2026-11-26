@@ -14,6 +14,17 @@ after a change.
 | `NODE_ENV` | Optional. Set explicitly in deployed environments. | Unset is treated as non-production by environment checks; `production` enables strict startup validation, and `test` enables test-only behavior. |
 | `PORT` | Optional. | `4000`. |
 
+## Request body limit
+
+JSON request bodies are capped at **100kb** by the explicit
+`express.json({ limit: "100kb" })` in `backend/src/app.ts` (#519). This is a
+deliberate code constant (`JSON_BODY_LIMIT`), not the body-parser default and
+not an environment variable; changing it is a code change. A body over the cap
+returns `413` with `code: "PAYLOAD_TOO_LARGE"` and the request id, and is not
+sent to Sentry. Unsupported charsets/content encodings return `415`. The email
+webhook route uses `express.raw()` so Svix can verify the exact signed bytes
+and is unaffected by this JSON cap.
+
 ## Browser access and proxy
 
 | Variable | Required? | Default / behavior |
@@ -106,6 +117,7 @@ as well if the listener needs a non-default endpoint.
 | --- | --- | --- |
 | `RESEND_API_KEY` | Optional. | Unset; outbound messages are logged instead of sent. |
 | `EMAIL_FROM` | Optional. | `SupportMe <notifications@supportme.app>`. Use a sender verified with Resend in deployed environments. |
+| `EMAIL_SEND_TIMEOUT_MS` | Optional. | `10000`. Upper bound on a single Resend HTTP call; a call that exceeds it is aborted and recorded as a `FAILED` EmailEvent, so a hung provider cannot hold a request open. Must be a positive integer. |
 | `APP_URL` | Optional locally; set to the canonical public frontend URL in staging and production. | Context-dependent: some email/SEO paths fall back to `https://supportme.app`, while magic-link, notification and preview paths fall back to `https://localhost:3000` (the frontend's local HTTPS dev origin). Set it explicitly outside local development so generated links point to the right environment. |
 | `RESEND_WEBHOOK_SECRET` | Optional for the app; required to accept Resend webhook requests. | Unset; webhook requests are rejected when no signing secret is configured. |
 | `NEXT_PUBLIC_STELLAR_NETWORK` | Optional. | `TESTNET`; used to select the network label/link in email templates and as a fallback for the backend's `STELLAR_NETWORK`. |

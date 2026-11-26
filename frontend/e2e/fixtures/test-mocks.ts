@@ -6,7 +6,6 @@ export const MOCK_CREATOR_ADDRESS = 'GC235RXOHGDYVO5P3UAGXATQ2W22XKH2LA64IZXQD6H
 
 export interface MockCreator {
   id: number;
-  userId?: number;
   username: string;
   displayName: string;
   walletAddress: string;
@@ -21,7 +20,6 @@ export interface MockCreator {
 
 export const DEFAULT_MOCK_CREATOR: MockCreator = {
   id: 1,
-  userId: 1,
   username: 'alice',
   displayName: 'Alice Creator',
   walletAddress: MOCK_CREATOR_ADDRESS,

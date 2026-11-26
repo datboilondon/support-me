@@ -1,5 +1,6 @@
 import { randomBytes, createHash } from "crypto";
 import prisma from "../prisma";
+import { log } from "../lib/logger";
 import { sendEmail } from "./email/mailer";
 import { magicLinkEmail } from "./email/templates";
 import { generateToken } from "../middleware/auth";
@@ -22,6 +23,12 @@ function hashToken(token: string): string {
  * have a SupportMe account. Callers should always return the same
  * generic "check your email" response regardless of this function's
  * internal path.
+ *
+ * The send is deliberately not awaited (#530): POST /api/auth/magic-link
+ * must not block on the provider, so a slow or unreachable Resend can never
+ * hold the request open. sendEmail bounds its own call with a timeout and
+ * records a FAILED EmailEvent, so a lost send is still visible; failures are
+ * caught here because this function must never reject.
  */
 export async function requestMagicLink(email: string): Promise<void> {
   const normalizedEmail = email.trim().toLowerCase();
@@ -39,9 +46,14 @@ export async function requestMagicLink(email: string): Promise<void> {
     data: { tokenHash, email: normalizedEmail, userId: user?.id, expiresAt },
   });
 
-  await sendEmail({
+  void sendEmail({
     to: normalizedEmail,
     ...magicLinkEmail({ verifyUrl: verifyUrl(token), expiresInMinutes: TOKEN_TTL_MS / 60_000 }),
+  }).catch((err: unknown) => {
+    log("error", "magic-link email failed", {
+      to: normalizedEmail,
+      error: err instanceof Error ? err.message : String(err),
+    });
   });
 }
 

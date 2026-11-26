@@ -1,9 +1,11 @@
 import { Router } from "express";
+import { Prisma } from "@prisma/client";
 import { Webhook } from "standardwebhooks";
 import prisma from "../prisma";
 import { asyncHandler } from "../middleware/asyncHandler";
 import { log } from "../lib/logger";
-import { BadRequestError, ServiceUnavailableError } from "../errors/AppError";
+import { normalizeRecipient } from "../services/email/mailer";
+import { BadRequestError } from "../errors/AppError";
 
 const router = Router();
 
@@ -24,7 +26,11 @@ function getWebhookSecret(): string | undefined {
 
 interface ResendWebhookPayload {
   type: "email.sent" | "email.delivered" | "email.bounced" | "email.complained" | string;
-  data: {
+  // Optional because a signature-valid payload is not guaranteed to carry
+  // `data`: reading through it unguarded turned a missing object into a
+  // TypeError, a 500, and a provider retry for a payload we could never
+  // process anyway (#534).
+  data?: {
     email_id?: string;
     to?: string[];
     subject?: string;
@@ -55,9 +61,10 @@ router.post(
 
     const webhook = new Webhook(secret);
     let event: ResendWebhookPayload;
+    const svixId = req.header("svix-id") || "";
     try {
       event = webhook.verify(payloadBody, {
-        "webhook-id": req.header("svix-id") || "",
+        "webhook-id": svixId,
         "webhook-timestamp": req.header("svix-timestamp") || "",
         "webhook-signature": req.header("svix-signature") || "",
       }) as unknown as ResendWebhookPayload;
@@ -68,9 +75,9 @@ router.post(
       throw new BadRequestError("Invalid webhook signature");
     }
 
-    const recipient = event.data.to?.[0];
-    if (!recipient) {
-      log("warn", "email webhook missing recipient", { type: event.type });
+    const data = event.data;
+    if (!data || typeof data !== "object") {
+      log("warn", "email webhook missing data object", { type: event.type });
       return res.status(200).json({ received: true });
     }
 
@@ -86,23 +93,33 @@ router.post(
       return res.status(200).json({ received: true });
     }
 
-    await prisma.emailEvent.create({
-      data: {
-        recipient,
-        subject: event.data.subject || "",
-        type,
-        providerMessageId: event.data.email_id,
-        errorDetail: event.data.bounce?.message,
-      },
-    });
+    try {
+      await prisma.emailEvent.create({
+        data: {
+          recipient,
+          subject: event.data.subject || "",
+          type,
+          providerMessageId: event.data.email_id,
+          svixId,
+          errorDetail: event.data.bounce?.message,
+        },
+      });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+        return res.status(200).json({ received: true });
+      }
+      throw err;
+    }
 
     if (type === "BOUNCED" || type === "COMPLAINED") {
-      log("warn", "email delivery failure reported by provider", {
-        to: recipient,
-        type,
-        providerMessageId: event.data.email_id,
-        error: event.data.bounce?.message,
-      });
+      for (const recipient of recipients) {
+        log("warn", "email delivery failure reported by provider", {
+          to: recipient,
+          type,
+          providerMessageId: data.email_id,
+          error: data.bounce?.message,
+        });
+      }
     }
 
     return res.status(200).json({ received: true });

@@ -12,6 +12,9 @@ jest.mock("../../prisma", () => ({
       update: jest.fn(),
       delete: jest.fn(),
     },
+    goalPeriod: {
+      findMany: jest.fn(),
+    },
   },
 }));
 
@@ -36,6 +39,7 @@ const mockedPrisma = prisma as unknown as {
     update: jest.Mock;
     delete: jest.Mock;
   };
+  goalPeriod: { findMany: jest.Mock };
 };
 
 describe("GET /api/goals/:username", () => {
@@ -81,6 +85,40 @@ describe("GET /api/goals/:username", () => {
 
 describe("POST /api/goals/:username", () => {
   const token = generateToken(1, "GUSERADDRESS");
+
+  it.each([
+    ["XLM", { acceptsXlm: false, acceptsUsdc: true, acceptsUsdt: true }, "USDC, USDT"],
+    ["USDC", { acceptsXlm: true, acceptsUsdc: false, acceptsUsdt: true }, "XLM, USDT"],
+    ["USDT", { acceptsXlm: true, acceptsUsdc: true, acceptsUsdt: false }, "XLM, USDC"],
+  ])("rejects %s when the creator has disabled it", async (currency, preferences, allowed) => {
+    mockedPrisma.creator.findUnique.mockResolvedValue({
+      id: 7,
+      userId: 1,
+      username: "bob",
+      ...preferences,
+    });
+
+    const res = await request(app)
+      .post("/api/goals/bob")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ targetAmount: 100, currency });
+
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("BAD_REQUEST");
+    expect(res.body.error).toContain(`Allowed currencies: ${allowed}`);
+    expect(mockedPrisma.goal.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unknown currency code", async () => {
+    const res = await request(app)
+      .post("/api/goals/bob")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ targetAmount: 100, currency: "DOGE" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("VALIDATION_ERROR");
+    expect(mockedPrisma.creator.findUnique).not.toHaveBeenCalled();
+  });
 
   it("rejects requests without an auth token", async () => {
     const res = await request(app).post("/api/goals/bob").send({ targetAmount: 100 });
@@ -182,7 +220,12 @@ describe("POST /api/goals/:username", () => {
   });
 
   it("creates a goal denominated in USDT (issue #18)", async () => {
-    mockedPrisma.creator.findUnique.mockResolvedValue({ id: 7, userId: 1, username: "bob" });
+    mockedPrisma.creator.findUnique.mockResolvedValue({
+      id: 7,
+      userId: 1,
+      username: "bob",
+      acceptsUsdt: true,
+    });
     const created = { id: 3, creatorId: 7, title: "Server costs", targetAmount: 300, currency: "USDT" };
     mockedPrisma.goal.create.mockResolvedValue(created);
 
@@ -198,7 +241,7 @@ describe("POST /api/goals/:username", () => {
     });
   });
 
-  it("creates a recurring monthly goal with a computed currentPeriodEnd ~30 days out", async () => {
+  it("creates a recurring monthly goal with a currentPeriodEnd one calendar month out", async () => {
     mockedPrisma.creator.findUnique.mockResolvedValue({ id: 7, userId: 1, username: "bob" });
     mockedPrisma.goal.create.mockResolvedValue({ id: 2 });
 
@@ -210,9 +253,63 @@ describe("POST /api/goals/:username", () => {
     const call = mockedPrisma.goal.create.mock.calls[0][0];
     expect(call.data.recurring).toBe(true);
     expect(call.data.recurrenceInterval).toBe("MONTHLY");
+    // A calendar month is 28–31 days depending on when the test runs.
     const deltaMs = call.data.currentPeriodEnd.getTime() - Date.now();
-    expect(deltaMs).toBeGreaterThan(29 * 24 * 60 * 60 * 1000);
-    expect(deltaMs).toBeLessThanOrEqual(30 * 24 * 60 * 60 * 1000);
+    expect(deltaMs).toBeGreaterThan(27 * 24 * 60 * 60 * 1000);
+    expect(deltaMs).toBeLessThanOrEqual(31 * 24 * 60 * 60 * 1000);
+  });
+});
+
+describe("GET /api/goals/:id/periods", () => {
+  it("returns 404 when the goal does not exist", async () => {
+    mockedPrisma.goal.findUnique.mockResolvedValue(null);
+
+    const res = await request(app).get("/api/goals/1/periods");
+
+    expect(res.status).toBe(404);
+    expect(res.body.code).toBe("NOT_FOUND");
+    expect(mockedPrisma.goalPeriod.findMany).not.toHaveBeenCalled();
+  });
+
+  it("lists a goal's finished periods newest first (public, no auth required)", async () => {
+    mockedPrisma.goal.findUnique.mockResolvedValue({ id: 1, recurring: true });
+    const periods = [
+      {
+        id: 2,
+        goalId: 1,
+        start: "2026-03-02T09:00:00.000Z",
+        end: "2026-03-09T09:00:00.000Z",
+        raised: 120.5,
+        targetAmount: 100,
+        reached: true,
+      },
+      {
+        id: 1,
+        goalId: 1,
+        start: "2026-02-23T09:00:00.000Z",
+        end: "2026-03-02T09:00:00.000Z",
+        raised: 80,
+        targetAmount: 100,
+        reached: false,
+      },
+    ];
+    mockedPrisma.goalPeriod.findMany.mockResolvedValue(periods);
+
+    const res = await request(app).get("/api/goals/1/periods");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ items: periods });
+    expect(mockedPrisma.goalPeriod.findMany).toHaveBeenCalledWith({
+      where: { goalId: 1 },
+      orderBy: { end: "desc" },
+    });
+  });
+
+  it("rejects a non-numeric goal id", async () => {
+    const res = await request(app).get("/api/goals/abc/periods");
+
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("VALIDATION_ERROR");
   });
 });
 

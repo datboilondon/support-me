@@ -1,4 +1,5 @@
 import {
+  isCheckConstraintViolation,
   sorobanEventListener,
   RawEvent,
 } from "../../services/sorobanEventListener";
@@ -119,6 +120,28 @@ function donatedRawEvent(overrides: Partial<RawEvent> = {}): RawEvent {
     ...overrides,
   };
 }
+
+describe("isCheckConstraintViolation", () => {
+  it("recognizes the raw-SQL and ORM-wrapped forms of SQLSTATE 23514", () => {
+    expect(isCheckConstraintViolation({ code: "23514" })).toBe(true);
+    expect(isCheckConstraintViolation({ code: "P2010", meta: { code: "23514" } })).toBe(true);
+    expect(
+      isCheckConstraintViolation({
+        message:
+          'Error occurred during query execution: PostgresError { code: "23514", message: "violates check constraint" }',
+      })
+    ).toBe(true);
+    expect(
+      isCheckConstraintViolation({ code: "P2004", meta: { database_error: 'violates check constraint "x"' } })
+    ).toBe(true);
+  });
+
+  it("does not mistake other Prisma failures for a CHECK violation", () => {
+    expect(isCheckConstraintViolation({ code: "P2002" })).toBe(false);
+    expect(isCheckConstraintViolation(new Error("connection reset"))).toBe(false);
+    expect(isCheckConstraintViolation(null)).toBe(false);
+  });
+});
 
 describe("SorobanEventListener event processing & reconciliation", () => {
   beforeEach(() => {
@@ -492,6 +515,7 @@ describe("SorobanEventListener donated reconciliation (#259)", () => {
         transactionHash: "tx_hash_donated_123",
         rpcEventId: "0000000000001050-00000",
         verified: true,
+        currencyAccepted: true,
       }),
     });
     // The donation is applied to the creator's goals exactly once ...
@@ -502,6 +526,28 @@ describe("SorobanEventListener donated reconciliation (#259)", () => {
     expect(mockedNotifyReceived).toHaveBeenCalledTimes(1);
     expect(mockedNotifyConfirmation).toHaveBeenCalledTimes(1);
     expect(mockedNotifyGoalsReached).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an on-chain donation and flags it when the creator has disabled its currency", async () => {
+    mockedPrisma.creator.findFirst.mockResolvedValue({
+      id: 7,
+      acceptsXlm: false,
+      acceptsUsdc: true,
+      acceptsUsdt: false,
+    });
+    mockedPrisma.donation.findFirst.mockResolvedValue(null);
+    mockedPrisma.donation.create.mockResolvedValue({ id: 10, creatorId: 7 });
+
+    await sorobanEventListener.processEvent(donatedRawEvent());
+    await flushNotifications();
+
+    expect(mockedPrisma.donation.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        currency: "XLM",
+        currencyAccepted: false,
+        verified: true,
+      }),
+    });
   });
 
   it("verifies a pending client report and backfills the authoritative event data", async () => {
@@ -530,6 +576,7 @@ describe("SorobanEventListener donated reconciliation (#259)", () => {
         rpcEventId: "0000000000001050-00000",
         amount: 150,
         currency: "XLM",
+        currencyAccepted: true,
       }),
     });
     expect(mockedPrisma.donation.create).not.toHaveBeenCalled();
@@ -545,7 +592,10 @@ describe("SorobanEventListener donated reconciliation (#259)", () => {
     await flushNotifications();
 
     expect(mockedPrisma.donation.create).not.toHaveBeenCalled();
-    expect(mockedPrisma.donation.updateMany).not.toHaveBeenCalled();
+    expect(mockedPrisma.donation.updateMany).toHaveBeenCalledWith({
+      where: { id: 5, verified: true },
+      data: { currencyAccepted: true },
+    });
     // No double-counting: neither goals nor notifications are touched.
     expect(mockedPrisma.goal.findMany).not.toHaveBeenCalled();
     expect(mockedNotifyReceived).not.toHaveBeenCalled();

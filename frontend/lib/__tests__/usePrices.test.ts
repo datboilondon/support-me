@@ -34,7 +34,7 @@ describe('usePrices (#460)', () => {
     expect(mockFetchUsdPrices).toHaveBeenCalledTimes(1);
   });
 
-  it('sets an empty map when the fetch returns an empty map', async () => {
+  it('stays null when the fetch returns an empty map', async () => {
     mockFetchUsdPrices.mockResolvedValue({});
     const { result } = renderHook(() => usePrices(60_000));
 
@@ -42,11 +42,11 @@ describe('usePrices (#460)', () => {
       await vi.advanceTimersByTimeAsync(0);
     });
 
-    expect(result.current).toEqual({});
+    expect(result.current).toBeNull();
   });
 
   it('stays null when the fetch returns null', async () => {
-    mockFetchUsdPrices.mockResolvedValue(null as unknown as Record<string, number>);
+    mockFetchUsdPrices.mockResolvedValue(null);
     const { result } = renderHook(() => usePrices(60_000));
 
     await act(async () => {
@@ -54,6 +54,56 @@ describe('usePrices (#460)', () => {
     });
 
     expect(result.current).toBeNull();
+  });
+
+  it('retains the last known prices when a subsequent poll fails', async () => {
+    mockFetchUsdPrices
+      .mockResolvedValueOnce(prices)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({});
+
+    const { result } = renderHook(() => usePrices(60_000));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(result.current).toEqual(prices);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(result.current).toEqual(prices);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(result.current).toEqual(prices);
+  });
+
+  it('pauses polling while document.visibilityState is hidden and resumes when visible', async () => {
+    let visibility: DocumentVisibilityState = 'hidden';
+    const spy = vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() => visibility);
+
+    renderHook(() => usePrices(60_000));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(mockFetchUsdPrices).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(120_000);
+    });
+    expect(mockFetchUsdPrices).not.toHaveBeenCalled();
+
+    visibility = 'visible';
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(mockFetchUsdPrices).toHaveBeenCalledTimes(1);
+
+    spy.mockRestore();
   });
 
   it('refetches on the refresh interval', async () => {

@@ -28,7 +28,11 @@ export interface AuthRequest extends Request {
 // account) cheap.
 const deletedAtCache = new TtlCache<Date | null>(30_000);
 
-async function isUserDeleted(userId: number): Promise<boolean> {
+export function clearDeletedAtCache(): void {
+  deletedAtCache.clear();
+}
+
+export async function isUserDeleted(userId: number): Promise<boolean> {
   const cached = await deletedAtCache.getOrSet(String(userId), async () => {
     const user = await prisma.user.findUnique({
       where: { id: userId },

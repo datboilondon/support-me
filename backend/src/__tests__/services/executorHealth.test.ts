@@ -51,6 +51,115 @@ describe("executorHealth", () => {
     expect(health.lastSuccessAt).toBeNull();
   });
 
+  it("reports unhealthy and failed counts when every charge in a run fails (#500)", () => {
+    executorHealth.markEnabled(60_000);
+    executorHealth.runStarted();
+    executorHealth.recordCharge(1, "failure", "insufficient balance");
+    executorHealth.recordCharge(2, "failure", "allowance revoked");
+    executorHealth.runFinished(true);
+
+    const health = executorHealth.getHealth();
+    expect(health.status).toBe("unhealthy");
+    expect(health.lastRun).toEqual({
+      successCount: 0,
+      failureCount: 2,
+      attemptedCount: 2,
+      failureRate: 1,
+      status: "failed",
+    });
+    expect(health.lastRunError).toBe("all 2 attempted charges failed");
+    // A run that charged nothing successfully is not a success.
+    expect(health.lastSuccessAt).toBeNull();
+  });
+
+  it("reports degraded when the failure rate in a mixed run exceeds the threshold (#500)", () => {
+    executorHealth.markEnabled(60_000);
+    executorHealth.runStarted();
+    executorHealth.recordCharge(1, "success");
+    executorHealth.recordCharge(2, "failure", "insufficient balance");
+    executorHealth.recordCharge(3, "failure", "allowance revoked");
+    executorHealth.runFinished(true);
+
+    const health = executorHealth.getHealth();
+    expect(health.status).toBe("degraded");
+    expect(health.lastRun).toMatchObject({
+      successCount: 1,
+      failureCount: 2,
+      attemptedCount: 3,
+      status: "degraded",
+    });
+    expect(health.lastRun?.failureRate).toBeCloseTo(2 / 3);
+    expect(health.lastSuccessAt).not.toBeNull();
+  });
+
+  it("stays ok for a mixed run at or below the failure-rate threshold (#500)", () => {
+    executorHealth.markEnabled(60_000);
+    executorHealth.runStarted();
+    executorHealth.recordCharge(1, "success");
+    executorHealth.recordCharge(2, "success");
+    executorHealth.recordCharge(3, "failure", "allowance revoked");
+    executorHealth.runFinished(true);
+
+    const health = executorHealth.getHealth();
+    expect(health.status).toBe("ok");
+    expect(health.lastRun).toMatchObject({
+      successCount: 2,
+      failureCount: 1,
+      attemptedCount: 3,
+      status: "ok",
+    });
+  });
+
+  it("reports ok with success counts when every charge in a run succeeds (#500)", () => {
+    executorHealth.markEnabled(60_000);
+    executorHealth.runStarted();
+    executorHealth.recordCharge(1, "success");
+    executorHealth.recordCharge(2, "success");
+    executorHealth.recordCharge(3, "success");
+    executorHealth.runFinished(true);
+
+    const health = executorHealth.getHealth();
+    expect(health.status).toBe("ok");
+    expect(health.lastRun).toEqual({
+      successCount: 3,
+      failureCount: 0,
+      attemptedCount: 3,
+      failureRate: 0,
+      status: "ok",
+    });
+  });
+
+  it("counts charge outcomes per run instead of cumulatively across runs (#500)", () => {
+    executorHealth.markEnabled(60_000);
+    executorHealth.runStarted();
+    executorHealth.recordCharge(1, "failure", "insufficient balance");
+    executorHealth.runFinished(true);
+
+    executorHealth.runStarted();
+    executorHealth.recordCharge(2, "success");
+    executorHealth.runFinished(true);
+
+    const health = executorHealth.getHealth();
+    expect(health.status).toBe("ok");
+    expect(health.lastRun).toMatchObject({ successCount: 1, failureCount: 0 });
+  });
+
+  it("reports ok for a run that had no due charges (#500)", () => {
+    executorHealth.markEnabled(60_000);
+    executorHealth.runStarted();
+    executorHealth.runFinished(true);
+
+    const health = executorHealth.getHealth();
+    expect(health.status).toBe("ok");
+    expect(health.lastRun).toEqual({
+      successCount: 0,
+      failureCount: 0,
+      attemptedCount: 0,
+      failureRate: 0,
+      status: "ok",
+    });
+  });
+
   it("tracks recent charge outcomes with success/failure counts", () => {
     executorHealth.markEnabled(60_000);
     executorHealth.recordCharge(1, "success");

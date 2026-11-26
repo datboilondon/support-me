@@ -7,6 +7,8 @@ import { validateStellarNetworkSetup } from "./services/startupValidation";
 import { networkReset } from "./services/networkReset";
 import { log } from "./lib/logger";
 import prisma from "./prisma";
+import { closeHttpServer } from "./services/gracefulHttpShutdown";
+import { endActiveEventsStreams } from "./routes/events";
 
 async function main(): Promise<void> {
   validateConfig();
@@ -55,10 +57,12 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string) => {
     log("info", `Received ${signal}, starting graceful shutdown`);
 
-    // Stop accepting new connections
-    server.close(() => {
-      log("info", "HTTP server closed, no longer accepting connections");
-    });
+    // Let SSE clients observe a clean stream end before stopping HTTP accepts.
+    endActiveEventsStreams();
+    const httpClose = closeHttpServer(
+      server,
+      Math.min(5000, Math.floor(shutdownTimeoutMs / 2))
+    );
 
     // Stop background workers
     sorobanEventListener.stop();
@@ -71,6 +75,9 @@ async function main(): Promise<void> {
     }
 
     subscriptionExecutor.stop();
+
+    await httpClose;
+    log("info", "HTTP server closed, no longer accepting connections");
 
     // Disconnect Prisma
     await prisma.$disconnect();
@@ -88,8 +95,8 @@ async function main(): Promise<void> {
   const shutdownWithTimeout = (signal: string) => {
     const timeout = setTimeout(forceExit, shutdownTimeoutMs);
     void shutdown(signal)
-      .catch((error) => log("error", `Shutdown failed after ${signal}`, { error }))
-      .finally(() => clearTimeout(timeout));
+      .then(() => clearTimeout(timeout))
+      .catch((error) => log("error", `Shutdown failed after ${signal}`, { error }));
   };
 
   process.on("SIGTERM", () => shutdownWithTimeout("SIGTERM"));

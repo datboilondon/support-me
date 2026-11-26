@@ -22,6 +22,9 @@ import * as Sentry from "@sentry/node";
 import { getNetworkPassphrase } from "../services/stellarNetwork";
 import { log } from "./logger";
 
+export const ASSET_CODES = ["XLM", "USDC", "USDT"] as const;
+export type AssetCode = (typeof ASSET_CODES)[number];
+
 export interface AssetConfig {
   code: string;
   issuerEnv?: string;
@@ -32,6 +35,27 @@ export const CREDIT_ASSETS: AssetConfig[] = [
   { code: "USDC", issuerEnv: "SOROBAN_USDC_ISSUER", tokenIdEnv: "SOROBAN_USDC_TOKEN_ID" },
   { code: "USDT", issuerEnv: "SOROBAN_USDT_ISSUER", tokenIdEnv: "SOROBAN_USDT_TOKEN_ID" },
 ];
+
+export interface CreatorAssetPreferences {
+  acceptsXlm?: boolean;
+  acceptsUsdc?: boolean;
+  acceptsUsdt?: boolean;
+}
+
+export function getAcceptedCurrencies(creator: CreatorAssetPreferences): AssetCode[] {
+  return [
+    ...(creator.acceptsXlm !== false ? (["XLM"] as const) : []),
+    ...(creator.acceptsUsdc !== false ? (["USDC"] as const) : []),
+    ...(creator.acceptsUsdt === true ? (["USDT"] as const) : []),
+  ];
+}
+
+export function isCurrencyAccepted(
+  creator: CreatorAssetPreferences,
+  currency: string
+): boolean {
+  return getAcceptedCurrencies(creator).some((acceptedCurrency) => acceptedCurrency === currency);
+}
 
 let cachedMapping: Map<string, string> | null = null;
 

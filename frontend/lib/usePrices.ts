@@ -13,15 +13,28 @@ export function usePrices(refreshMs = 60_000): Record<string, number> | null {
     let active = true;
 
     const load = async (): Promise<void> => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        return;
+      }
       const p = await fetchUsdPrices();
-      if (active && p) setPrices(p);
+      if (active && p && Object.keys(p).length > 0) {
+        setPrices(p);
+      }
     };
 
-    load();
+    const handleVisibilityChange = (): void => {
+      if (document.visibilityState === 'visible') {
+        void load();
+      }
+    };
+
+    void load();
     const timer = window.setInterval(load, refreshMs);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => {
       active = false;
       window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [refreshMs]);
 

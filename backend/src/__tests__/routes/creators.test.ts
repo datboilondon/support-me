@@ -22,7 +22,7 @@ import { Prisma } from "@prisma/client";
 import app from "../../app";
 import prisma from "../../prisma";
 import { generateToken } from "../../middleware/auth";
-import { leaderboardCache } from "../../routes/creators";
+import { creatorProfileCache, leaderboardCache } from "../../routes/creators";
 import { challenges } from "../../routes/auth";
 import { Keypair } from "@stellar/stellar-sdk";
 
@@ -41,9 +41,55 @@ const mockedPrisma = prisma as unknown as {
   };
 };
 
+const publicCreator = {
+  id: 42,
+  username: "publicalice",
+  walletAddress: null,
+  displayName: "Alice",
+  bio: "Making things",
+  avatarUrl: null,
+  socialLinks: { github: "https://github.com/alice" },
+  acceptsXlm: true,
+  acceptsUsdc: true,
+  acceptsUsdt: false,
+  donationGoal: null,
+  presetAmounts: [1.25, 5],
+  theme: { backgroundColor: "#ffffff", accentColor: "#000000", font: "sans", layout: "default" },
+  createdAt: "2026-01-01T00:00:00.000Z",
+  updatedAt: "2026-01-02T00:00:00.000Z",
+};
+
+// Unexpected future fields and relations must not leak through the allowlist.
+const privateCreator = {
+  ...publicCreator,
+  userId: 123,
+  user: { id: 123, email: "private@example.com" },
+  internalId: "private-link",
+  donations: [{ id: 456, creatorId: 42 }],
+  presetAmounts: [new Prisma.Decimal("1.25"), new Prisma.Decimal("5")],
+  createdAt: new Date(publicCreator.createdAt),
+  updatedAt: new Date(publicCreator.updatedAt),
+};
+
 describe("GET /api/creators", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+  });
+
+  it.each(["newest", "most-supported"])("allowlists public discovery fields for %s", async (sort) => {
+    mockedPrisma.$queryRaw.mockResolvedValue([{ id: 42 }]);
+    mockedPrisma.creator.findMany.mockResolvedValue([
+      { ...privateCreator, _count: { donations: 7, internalId: 999 } },
+    ]);
+    mockedPrisma.creator.count.mockResolvedValue(1);
+
+    const res = await request(app).get(`/api/creators?sort=${sort}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      items: [{ ...publicCreator, _count: { donations: 7 } }],
+      pagination: { page: 1, limit: 20, total: 1, totalPages: 1 },
+    });
   });
 
   it("lists creators, newest first by default", async () => {
@@ -152,8 +198,40 @@ describe("GET /api/creators/me", () => {
 });
 
 describe("GET /api/creators/:username", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    creatorProfileCache.clear();
+  });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  it("allowlists public fields on cache misses and hits without mutating the record", async () => {
+    mockedPrisma.creator.findUnique.mockResolvedValue(privateCreator);
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const res = await request(app).get("/api/creators/publicalice");
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual(publicCreator);
+      expect(res.body).not.toHaveProperty("userId");
+    }
+    expect(mockedPrisma.creator.findUnique).toHaveBeenCalledTimes(1);
+    expect(creatorProfileCache.get("publicalice")).toBe(privateCreator);
+    expect(privateCreator.userId).toBe(123);
+  });
+
+  it("allowlists public fields when the cache fails and the route reads the database", async () => {
+    jest.spyOn(creatorProfileCache, "getOrSet").mockRejectedValueOnce(new Error("cache unavailable"));
+    mockedPrisma.creator.findUnique.mockResolvedValue(privateCreator);
+
+    const res = await request(app).get("/api/creators/publicalice");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(publicCreator);
+    expect(mockedPrisma.creator.findUnique).toHaveBeenCalledWith({ where: { username: "publicalice" } });
+  });
+
   it("returns the creator when found", async () => {
-    const creator = { id: 1, username: "bob", donations: [] };
+    const creator = { id: 1, username: "bob" };
     mockedPrisma.creator.findUnique.mockResolvedValue(creator);
 
     const res = await request(app).get("/api/creators/bob");
@@ -734,20 +812,12 @@ describe("GET /api/creators/me/stats (#224)", () => {
 
   it("aggregates only the creator's verified donations", async () => {
     mockedPrisma.creator.findUnique.mockResolvedValue({ id: 5, userId: 1, username: "bob" });
-    mockedPrisma.donation.groupBy
-      .mockResolvedValueOnce([
-        {
-          currency: "XLM",
-          _count: { _all: 2 },
-          _sum: { amount: new Prisma.Decimal("30") },
-          _avg: { amount: new Prisma.Decimal("15") },
-          _max: { amount: new Prisma.Decimal("25") },
-        },
-      ])
-      .mockResolvedValueOnce([
-        { currency: "XLM", senderAddress: "GA" },
-        { currency: "XLM", senderAddress: "GB" },
-      ]);
+    mockedPrisma.$queryRaw.mockResolvedValue([
+      { currency: "XLM", donationCount: 2n, uniqueSupporters: 2n,
+        total: new Prisma.Decimal("30"), average: new Prisma.Decimal("15"), largest: new Prisma.Decimal("25") },
+      { currency: null, donationCount: 2n, uniqueSupporters: 2n,
+        total: new Prisma.Decimal("30"), average: new Prisma.Decimal("15"), largest: new Prisma.Decimal("25") },
+    ]);
 
     const res = await request(app)
       .get("/api/creators/me/stats")
@@ -768,9 +838,7 @@ describe("GET /api/creators/me/stats (#224)", () => {
         },
       ],
     });
-    for (const call of mockedPrisma.donation.groupBy.mock.calls) {
-      expect(call[0].where).toEqual({ creatorId: 5, verified: true });
-    }
+    expect(mockedPrisma.$queryRaw).toHaveBeenCalledWith(expect.any(Array), 5);
   });
 });
 

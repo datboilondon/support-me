@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { assetCode } from "./common";
+import { supportedAssetCode } from "./common";
 
 // Kept intentionally small (weekly/monthly) — see the comment on
 // `RecurrenceInterval` in prisma/schema.prisma for why this isn't a general
@@ -25,7 +25,7 @@ export const createGoalSchema = z
     title: z.string().max(80).optional(),
     description: z.string().max(500).optional(),
     targetAmount: z.coerce.number().positive("targetAmount must be a positive number"),
-    currency: assetCode.default("XLM"),
+    currency: supportedAssetCode.default("XLM"),
     recurring: z.boolean().optional().default(false),
     recurrenceInterval: recurrenceIntervalSchema.optional(),
   })

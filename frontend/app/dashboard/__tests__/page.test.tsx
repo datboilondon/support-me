@@ -661,4 +661,22 @@ describe('DashboardPage', () => {
       expect(screen.queryByText('The server returned an error. Please try again.')).not.toBeInTheDocument();
     });
   });
+
+  it('shows a retry card instead of create-username CTA when creator fails to load', () => {
+    const invalidate = vi.fn();
+    mockUseCreator.mockReturnValue({
+      creator: null,
+      loading: false,
+      error: 'Failed to load your profile',
+      invalidate,
+    });
+
+    render(<DashboardPage />);
+
+    expect(screen.getByText('Failed to load your profile')).toBeInTheDocument();
+    expect(screen.queryByText(/create a username first/i)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }));
+    expect(invalidate).toHaveBeenCalledTimes(1);
+  });
 });

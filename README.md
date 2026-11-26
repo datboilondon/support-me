@@ -592,6 +592,15 @@ migration copies any existing single goal into a `Goal` row (see
 [`backend/prisma/migrations`](backend/prisma/migrations)) rather than
 dropping it.
 
+### GoalPeriod
+
+```
+id, goalId (foreign key), start, end, raised, targetAmount, reached, createdAt
+```
+
+One row per finished period of a recurring goal, written by the reset just
+before `Goal.currentAmount` is zeroed.
+
 ### Donation
 
 ```

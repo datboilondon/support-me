@@ -6,6 +6,8 @@ export type ErrorBoundaryName = 'route' | 'global';
 // tagged with the boundary and the route the user was on so issues can be
 // grouped/filtered by page. The Error object carries the stack trace; the
 // digest links client reports to the server-side error for the same render.
+// Only the pathname is reported: the query string can carry single-use secrets
+// (magic-link tokens, OAuth code/state), so it is never sent to Sentry.
 export function reportBoundaryError(
   error: Error & { digest?: string },
   boundary: ErrorBoundaryName,
@@ -13,7 +15,6 @@ export function reportBoundaryError(
 ) {
   const route =
     pathname ?? (typeof window !== 'undefined' ? window.location.pathname : undefined);
-  const search = typeof window !== 'undefined' ? window.location.search : undefined;
 
   // Sentry's scope helpers (withScope/getIsolationScope) are not exported in
   // @sentry/nextjs's type surface, so the boundary metadata is attached via the
@@ -29,7 +30,6 @@ export function reportBoundaryError(
       error_boundary: {
         boundary,
         route,
-        search: search || undefined,
         digest: error.digest,
       },
     },

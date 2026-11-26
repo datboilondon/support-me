@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef, useLayoutEffect, useMemo } from 'react';
+import { useState, useEffect, useRef, useLayoutEffect, useMemo, useCallback } from 'react';
 import Link from 'next/link';
 import { notify } from '@/lib/notify';
 import { donationsCsvFilename, donationsToCsv, downloadCsv } from '@/lib/csv';
@@ -20,6 +20,7 @@ import { QrCodeCard } from '@/components/QrCodeCard';
 import { DashboardStats, type CreatorStats } from '@/components/DashboardStats';
 import { usePrices } from '@/lib/usePrices';
 import { formatUsd } from '@/lib/prices';
+import { formatAmount } from '@/lib/format';
 import { API_URL } from '@/lib/api';
 import { explorerTxUrl } from '@/lib/stellarNetwork';
 
@@ -55,7 +56,7 @@ type ActivityItem =
 
 export default function DashboardPage() {
   const { user, token } = useAuth();
-  const { creator, loading } = useCreator();
+  const { creator, loading, error: creatorError, invalidate } = useCreator();
   const [donations, setDonations] = useState<Donation[]>([]);
   const [withdrawals, setWithdrawals] = useState<Withdrawal[]>([]);
   const [donationPage, setDonationPage] = useState(1);
@@ -86,53 +87,57 @@ export default function DashboardPage() {
     }
   }, [donations]);
 
-  useEffect(() => {
+  const fetchData = useCallback(async () => {
     if (!user || !creator) return;
 
     const authHeaders: Record<string, string> = {};
     if (token) authHeaders['Authorization'] = `Bearer ${token}`;
 
-    const fetchData = async () => {
-      try {
-        const [resDonations, resWithdrawals] = await Promise.all([
-          fetch(`${API_URL}/api/donations?creatorUsername=${encodeURIComponent(creator.username)}&page=1&limit=20`, {
-            credentials: 'include',
-            headers: authHeaders,
-          }),
-          fetch(`${API_URL}/api/withdrawals?creatorUsername=${creator.username}`, {
-            credentials: 'include',
-            headers: authHeaders,
-          }),
-        ]);
+    setError('');
+    try {
+      const [resDonations, resWithdrawals] = await Promise.all([
+        fetch(`${API_URL}/api/donations?creatorUsername=${encodeURIComponent(creator.username)}&page=1&limit=20`, {
+          credentials: 'include',
+          headers: authHeaders,
+        }),
+        fetch(`${API_URL}/api/withdrawals?creatorUsername=${encodeURIComponent(creator.username)}`, {
+          credentials: 'include',
+          headers: authHeaders,
+        }),
+      ]);
 
-        if (resDonations.ok) {
-          const donationsData = await resDonations.json();
-          const items = Array.isArray(donationsData) ? donationsData : donationsData.items || [];
-          setDonations(items);
-          setDonationPage(1);
-          if (donationsData.pagination) {
-            setTotalDonations(donationsData.pagination.total);
-            setTotalPages(donationsData.pagination.totalPages);
-            setHasMoreDonations(donationsData.pagination.page < donationsData.pagination.totalPages);
-          } else {
-            setTotalDonations(Array.isArray(donationsData) ? donationsData.length : items.length);
-            setTotalPages(1);
-            setHasMoreDonations(false);
-          }
-        }
-
-        if (resWithdrawals.ok) {
-          const withdrawalsData = await resWithdrawals.json();
-          setWithdrawals(Array.isArray(withdrawalsData) ? withdrawalsData : []);
-        }
-      } catch (err) {
-        setError((err as Error).message);
+      if (!resDonations.ok) {
+        throw new Error('The server returned an error. Please try again.');
       }
-    };
+      if (!resWithdrawals.ok) {
+        throw new Error('The server returned an error. Please try again.');
+      }
 
-    fetchData();
+      const donationsData = await resDonations.json();
+      const items = Array.isArray(donationsData) ? donationsData : donationsData.items || [];
+      setDonations(items);
+      setDonationPage(1);
+      if (donationsData.pagination) {
+        setTotalDonations(donationsData.pagination.total);
+        setTotalPages(donationsData.pagination.totalPages);
+        setHasMoreDonations(donationsData.pagination.page < donationsData.pagination.totalPages);
+      } else {
+        setTotalDonations(Array.isArray(donationsData) ? donationsData.length : items.length);
+        setTotalPages(1);
+        setHasMoreDonations(false);
+      }
+
+      const withdrawalsData = await resWithdrawals.json();
+      setWithdrawals(Array.isArray(withdrawalsData) ? withdrawalsData : []);
+    } catch (err) {
+      setError((err as Error).message || 'The server returned an error. Please try again.');
+    }
   }, [user, token, creator]);
 
+  useEffect(() => {
+    fetchData();
+  }, [fetchData]);
+  
   const [exporting, setExporting] = useState(false);
 
   // Exports the creator's full donation history (not just the pages loaded on
@@ -352,6 +357,22 @@ export default function DashboardPage() {
     );
   }
 
+  if (!creator && creatorError) {
+    return (
+      <ProtectedRoute>
+        <div className="min-h-screen bg-background flex items-center justify-center px-4">
+          <div className="card-brutal bg-card p-10 text-center max-w-md">
+            <h1 className="text-2xl font-extrabold text-ink mb-4">Couldn&apos;t Load Profile</h1>
+            <p className="text-muted font-medium mb-6">{creatorError}</p>
+            <button type="button" onClick={invalidate} className="btn-brutal btn-brutal-primary">
+              Retry
+            </button>
+          </div>
+        </div>
+      </ProtectedRoute>
+    );
+  }
+
   if (!creator) {
     return (
       <ProtectedRoute>
@@ -407,11 +428,11 @@ export default function DashboardPage() {
             <InlineError
               className="card-brutal bg-brand-pink p-4 mb-6 text-ink font-bold"
               message={error}
-              onRetry={() => setRetryNonce((n) => n + 1)}
+              onRetry={() => fetchData()}
             />
           )}
 
-          {donations.length === 0 ? (
+          {donations.length === 0 && !error ? (
             /* No tips yet — a zeroed stats grid and an empty chart would read as
                broken, so show an encouraging empty state with a share CTA instead. */
             <div className="card-brutal bg-card p-10 text-center mb-8">
@@ -447,7 +468,7 @@ export default function DashboardPage() {
                         {currency} Volume
                       </p>
                       <p className="text-2xl sm:text-3xl font-extrabold text-ink mt-2 tabular-nums">
-                        {Math.round(total).toLocaleString()} <span className="text-xl">{currency}</span>
+                        {formatAmount(total)} <span className="text-xl">{currency}</span>
                       </p>
                       {formatUsd(total, currency, prices) && (
                         <p className="text-sm font-bold text-ink/70 mt-1">{formatUsd(total, currency, prices)}</p>
@@ -463,7 +484,7 @@ export default function DashboardPage() {
                     <div className="mt-2 space-y-1">
                       {Object.entries(withdrawnByCurrency).map(([currency, amount]) => (
                         <p key={currency} className="text-2xl sm:text-3xl font-extrabold text-ink tabular-nums">
-                          {Math.round(amount)} <span className="text-xl">{currency}</span>
+                          {formatAmount(amount)} <span className="text-xl">{currency}</span>
                         </p>
                       ))}
                     </div>
@@ -596,7 +617,6 @@ export default function DashboardPage() {
                           target="_blank"
                           rel="noopener noreferrer"
                           title="View transaction on Stellar Expert"
-                          className="block -mx-2 px-2 rounded hover:bg-accent-bg focus:bg-accent-bg focus-visible:outline-[3px] focus-visible:outline-focus-ring focus-visible:outline-offset-2 transition-colors"
                         >
                           {row}
                         </a>

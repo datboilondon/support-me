@@ -25,6 +25,7 @@ interface Creator {
 interface CreatorContextType {
   creator: Creator | null;
   loading: boolean;
+  error?: string | null;
   invalidate: () => void;
 }
 
@@ -34,15 +35,20 @@ export function CreatorProvider({ children }: { children: ReactNode }) {
   const { user, token } = useAuth();
   const [creator, setCreator] = useState<Creator | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [fetchKey, setFetchKey] = useState(0);
 
   useEffect(() => {
     let active = true;
     const fetchCreator = async () => {
       if (!user) {
-        if (active) setLoading(false);
+        if (active) {
+          setError(null);
+          setLoading(false);
+        }
         return;
       }
+      if (active) setError(null);
       try {
         const headers: Record<string, string> = {};
         if (token) headers['Authorization'] = `Bearer ${token}`;
@@ -51,13 +57,22 @@ export function CreatorProvider({ children }: { children: ReactNode }) {
           headers,
         });
         if (res.status === 404) {
-          if (active) setCreator(null);
+          if (active) {
+            setCreator(null);
+            setError(null);
+          }
           return;
         }
         if (!res.ok) throw new Error('Failed to load your profile');
-        if (active) setCreator(await res.json());
-      } catch {
-        // Keep previous creator data on network errors
+        const data = await res.json();
+        if (active) {
+          setCreator(data);
+          setError(null);
+        }
+      } catch (err) {
+        if (active) {
+          setError(err instanceof Error ? err.message : 'Failed to load your profile');
+        }
       } finally {
         if (active) setLoading(false);
       }
@@ -66,10 +81,14 @@ export function CreatorProvider({ children }: { children: ReactNode }) {
     return () => { active = false; };
   }, [user, token, fetchKey]);
 
-  const invalidate = useCallback(() => setFetchKey((k) => k + 1), []);
+  const invalidate = useCallback(() => {
+    setLoading(true);
+    setError(null);
+    setFetchKey((k) => k + 1);
+  }, []);
 
   return (
-    <CreatorContext.Provider value={{ creator, loading, invalidate }}>
+    <CreatorContext.Provider value={{ creator, loading, error, invalidate }}>
       {children}
     </CreatorContext.Provider>
   );

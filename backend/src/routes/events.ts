@@ -14,6 +14,8 @@ import {
 } from "../services/eventBus";
 import { clientIp } from "../middleware/rateLimit";
 import { verifyToken } from "../lib/tokens";
+import { parseCookie, isUserDeleted } from "../middleware/auth";
+import { asyncHandler } from "../middleware/asyncHandler";
 
 const router = Router();
 
@@ -36,6 +38,11 @@ eventBus.setMaxListeners(Math.max(100, (maxGlobalConnections + 10) * 5));
 
 let activeGlobalConnections = 0;
 const activeIpConnections = new Map<string, number>();
+const activeEventStreamClosers = new Set<() => void>();
+
+export function endActiveEventsStreams(): void {
+  for (const close of [...activeEventStreamClosers]) close();
+}
 
 export function getActiveEventsConnectionCounts() {
   return {
@@ -53,47 +60,54 @@ export function resetEventsConnections() {
 }
 
 /**
- * Server-Sent Events stream of on-chain contract events (#370).
+ * Server-Sent Events stream of on-chain contract events (#370, #495).
  * Supports:
  * - Scoped filtering by ?creator= (or token-scoped)
  * - Sanitizing private fields (e.g. memo) on the public stream
  * - Global and per-IP connection limits with 429 responses
+ * - Authenticates via Authorization header or httpOnly cookie (#495)
+ * - Soft-deleted accounts cannot open authenticated streams (#495)
  */
-router.get("/", (req, res) => {
-  const ip = clientIp(req);
-  const ipCount = activeIpConnections.get(ip) ?? 0;
+router.get(
+  "/",
+  asyncHandler(async (req, res) => {
+    const ip = clientIp(req);
+    const ipCount = activeIpConnections.get(ip) ?? 0;
 
-  if (activeGlobalConnections >= maxGlobalConnections || ipCount >= maxIpConnections) {
-    res.setHeader("Retry-After", "30");
-    return res.status(429).json({
-      error: "Too many concurrent event connections, please retry later",
-      code: "TOO_MANY_REQUESTS",
-    });
-  }
-
-  activeGlobalConnections++;
-  activeIpConnections.set(ip, ipCount + 1);
-
-  const rawCreator = typeof req.query.creator === "string" ? req.query.creator.trim() : undefined;
-
-  let isAuthorized = false;
-  const token =
-    (typeof req.query.token === "string" ? req.query.token : undefined) ||
-    req.headers.authorization?.split(" ")[1];
-
-  let tokenWallet: string | null = null;
-  if (token) {
-    try {
-      tokenWallet = verifyToken(token).walletAddress;
-    } catch {
-      // Invalid token -> treated as public client
+    if (activeGlobalConnections >= maxGlobalConnections || ipCount >= maxIpConnections) {
+      res.setHeader("Retry-After", "30");
+      return res.status(429).json({
+        error: "Too many concurrent event connections, please retry later",
+        code: "TOO_MANY_REQUESTS",
+      });
     }
-  }
 
-  const creatorFilter = rawCreator || (tokenWallet ?? undefined);
-  if (tokenWallet && creatorFilter && tokenWallet.toLowerCase() === creatorFilter.toLowerCase()) {
-    isAuthorized = true;
-  }
+    activeGlobalConnections++;
+    activeIpConnections.set(ip, ipCount + 1);
+
+    const rawCreator = typeof req.query.creator === "string" ? req.query.creator.trim() : undefined;
+
+    let isAuthorized = false;
+    const authHeader = req.headers.authorization?.split(" ")[1];
+    const cookieToken = parseCookie(req.headers.cookie, "token");
+    const token = authHeader || cookieToken;
+
+    let tokenWallet: string | null = null;
+    if (token) {
+      try {
+        const decoded = verifyToken(token);
+        if (!(await isUserDeleted(decoded.id))) {
+          tokenWallet = decoded.walletAddress;
+        }
+      } catch {
+        // Invalid token -> treated as public client
+      }
+    }
+
+    const creatorFilter = rawCreator || (tokenWallet ?? undefined);
+    if (tokenWallet && creatorFilter && tokenWallet.toLowerCase() === creatorFilter.toLowerCase()) {
+      isAuthorized = true;
+    }
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -175,11 +189,13 @@ router.get("/", (req, res) => {
     eventBus.off(SUBSCRIPTION_CANCELLED_EVENT, onSubCancelled);
     eventBus.off(GOAL_UPDATED_EVENT, onGoalUpdated);
     eventBus.off(DONATION_RECORDED_EVENT, onDonationRecorded);
+    activeEventStreamClosers.delete(cleanup);
     res.end();
   };
 
+  activeEventStreamClosers.add(cleanup);
   req.on("close", cleanup);
   res.on("close", cleanup);
-});
+}));
 
 export default router;

@@ -6,6 +6,7 @@ import { validate } from "../middleware/validate";
 import { createSubscriptionSchema, listSubscriptionsQuerySchema } from "../schemas/subscriptions";
 import { idParamSchema } from "../schemas/common";
 import { ForbiddenError, NotFoundError, UnauthorizedError } from "../errors/AppError";
+import { assertCreatorAcceptsCurrency } from "../services/creatorCurrency";
 
 const router = Router();
 
@@ -79,6 +80,7 @@ router.post(
     if (!creator) {
       throw new NotFoundError("Creator not found");
     }
+    assertCreatorAcceptsCurrency(creator, token);
 
     // Idempotent on the on-chain subscription id, which is globally unique
     // (assigned by the donation contract's own counter).

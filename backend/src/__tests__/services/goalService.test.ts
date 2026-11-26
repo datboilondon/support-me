@@ -1,14 +1,21 @@
-jest.mock("../../prisma", () => ({
-  __esModule: true,
-  default: {
+jest.mock("../../prisma", () => {
+  const client = {
     goal: {
       findMany: jest.fn(),
       findUnique: jest.fn(),
       update: jest.fn(),
       updateMany: jest.fn(),
     },
-  },
-}));
+    goalPeriod: {
+      findFirst: jest.fn(),
+      create: jest.fn(),
+    },
+    // The reset runs in an interactive transaction; hand the callback the
+    // same mocked client so the in-memory stores below see its writes.
+    $transaction: jest.fn((callback: (tx: unknown) => unknown): unknown => callback(client)),
+  };
+  return { __esModule: true, default: client };
+});
 
 import { Prisma } from "@prisma/client";
 import prisma from "../../prisma";
@@ -20,6 +27,10 @@ const mockedPrisma = prisma as unknown as {
     findUnique: jest.Mock;
     update: jest.Mock;
     updateMany: jest.Mock;
+  };
+  goalPeriod: {
+    findFirst: jest.Mock;
+    create: jest.Mock;
   };
 };
 
@@ -38,6 +49,7 @@ type FakeGoal = {
   status?: string;
   recurrenceInterval?: string | null;
   currentPeriodEnd?: Date | null;
+  createdAt?: Date;
 };
 
 // Yields to the event loop so two "concurrent" donation flows can interleave
@@ -132,6 +144,32 @@ function createGoalStore(initialGoals: FakeGoal[]) {
   );
 
   return rows;
+}
+
+type FakePeriod = {
+  goalId: number;
+  start: Date;
+  end: Date;
+  raised: number | Prisma.Decimal;
+  targetAmount: number | Prisma.Decimal;
+  reached: boolean;
+};
+
+/** In-memory GoalPeriod table for the reset's history rows. */
+function createPeriodStore(initialPeriods: FakePeriod[] = []) {
+  const periods = initialPeriods.map((period) => ({ ...period }));
+
+  mockedPrisma.goalPeriod.findFirst.mockImplementation(async ({ where }: { where: { goalId: number } }) => {
+    const forGoal = periods.filter((period) => period.goalId === where.goalId);
+    forGoal.sort((a, b) => b.end.getTime() - a.end.getTime());
+    return forGoal[0] ? { ...forGoal[0] } : null;
+  });
+  mockedPrisma.goalPeriod.create.mockImplementation(async ({ data }: { data: FakePeriod }) => {
+    periods.push({ ...data });
+    return { ...data };
+  });
+
+  return periods;
 }
 
 describe("applyDonationToGoals", () => {
@@ -348,10 +386,27 @@ describe("concurrent donations (issue #262)", () => {
 });
 
 describe("computePeriodEnd", () => {
-  it("computes a MONTHLY period end 30 days out", () => {
+  it("computes a MONTHLY period end one calendar month out", () => {
     const from = new Date("2026-01-01T00:00:00.000Z");
     const end = computePeriodEnd("MONTHLY", from);
-    expect(end.toISOString()).toBe("2026-01-31T00:00:00.000Z");
+    expect(end.toISOString()).toBe("2026-02-01T00:00:00.000Z");
+  });
+
+  it("clamps a MONTHLY period end to the last day of a shorter month, keeping the time of day", () => {
+    expect(computePeriodEnd("MONTHLY", new Date("2026-01-31T15:30:00.000Z")).toISOString()).toBe(
+      "2026-02-28T15:30:00.000Z"
+    );
+    expect(computePeriodEnd("MONTHLY", new Date("2028-01-31T15:30:00.000Z")).toISOString()).toBe(
+      "2028-02-29T15:30:00.000Z"
+    );
+    expect(computePeriodEnd("MONTHLY", new Date("2026-03-31T00:00:00.000Z")).toISOString()).toBe(
+      "2026-04-30T00:00:00.000Z"
+    );
+  });
+
+  it("rolls a MONTHLY period end over the year boundary", () => {
+    const end = computePeriodEnd("MONTHLY", new Date("2026-12-31T00:00:00.000Z"));
+    expect(end.toISOString()).toBe("2027-01-31T00:00:00.000Z");
   });
 
   it("computes a WEEKLY period end 7 days out", () => {
@@ -362,6 +417,10 @@ describe("computePeriodEnd", () => {
 });
 
 describe("resetDueGoals", () => {
+  beforeEach(() => {
+    createPeriodStore();
+  });
+
   it("resets currentAmount to 0, reactivates, and rolls currentPeriodEnd forward for every due recurring goal", async () => {
     const now = new Date("2026-02-01T00:00:00.000Z");
     const rows = createGoalStore([
@@ -383,20 +442,197 @@ describe("resetDueGoals", () => {
     expect(mockedPrisma.goal.findMany).toHaveBeenCalledWith({
       where: { recurring: true, currentPeriodEnd: { lte: now } },
     });
-    // The reset is re-guarded on the same due-condition the findMany used,
+    // The period is claimed with the same due-condition the findMany used,
     // so a racing scheduler tick that already rolled the period forward
     // matches zero rows and can't reset the goal a second time (issue #262).
+    // The next end is one calendar month after the previous end (Jan 31 →
+    // Feb 28), not one interval after the tick time.
     expect(mockedPrisma.goal.updateMany).toHaveBeenCalledWith({
       where: { id: 1, recurring: true, currentPeriodEnd: { lte: now } },
-      data: {
-        currentAmount: 0,
-        status: "ACTIVE",
-        currentPeriodEnd: computePeriodEnd("MONTHLY", now),
-      },
+      data: { currentPeriodEnd: new Date("2026-02-28T00:00:00.000Z") },
+    });
+    expect(mockedPrisma.goal.update).toHaveBeenCalledWith({
+      where: { id: 1 },
+      data: { currentAmount: 0, status: "ACTIVE" },
     });
     expect(count).toBe(1);
     expect(rows.get(1)!.currentAmount).toBe(0);
     expect(rows.get(1)!.status).toBe("ACTIVE");
+    expect(rows.get(1)!.currentPeriodEnd).toEqual(new Date("2026-02-28T00:00:00.000Z"));
+  });
+
+  it("advances a goal due 10 minutes ago to exactly one interval after its old end, not after now", async () => {
+    const weeklyEnd = new Date("2026-03-02T09:00:00.000Z");
+    const monthlyEnd = new Date("2026-03-02T09:00:00.000Z");
+    const now = new Date(weeklyEnd.getTime() + 10 * 60 * 1000);
+    const rows = createGoalStore([
+      {
+        id: 1,
+        currentAmount: 30,
+        targetAmount: 100,
+        recurring: true,
+        recurrenceInterval: "WEEKLY",
+        status: "ACTIVE",
+        currentPeriodEnd: weeklyEnd,
+      },
+      {
+        id: 2,
+        currentAmount: 30,
+        targetAmount: 100,
+        recurring: true,
+        recurrenceInterval: "MONTHLY",
+        status: "ACTIVE",
+        currentPeriodEnd: monthlyEnd,
+      },
+    ]);
+
+    const count = await resetDueGoals(now);
+
+    expect(count).toBe(2);
+    expect(rows.get(1)!.currentPeriodEnd).toEqual(new Date("2026-03-09T09:00:00.000Z"));
+    expect(rows.get(2)!.currentPeriodEnd).toEqual(new Date("2026-04-02T09:00:00.000Z"));
+  });
+
+  it("skips over several missed periods, staying on the original schedule", async () => {
+    const oldEnd = new Date("2026-03-02T09:00:00.000Z");
+    // The backend was down for 17 days: two more weekly boundaries passed.
+    const now = new Date(oldEnd.getTime() + 17 * 24 * 60 * 60 * 1000);
+    const rows = createGoalStore([
+      {
+        id: 1,
+        currentAmount: 30,
+        targetAmount: 100,
+        recurring: true,
+        recurrenceInterval: "WEEKLY",
+        status: "ACTIVE",
+        currentPeriodEnd: oldEnd,
+      },
+    ]);
+    const periods = createPeriodStore();
+
+    const count = await resetDueGoals(now);
+
+    expect(count).toBe(1);
+    expect(mockedPrisma.goal.updateMany).toHaveBeenCalledTimes(1);
+    expect(rows.get(1)!.currentPeriodEnd).toEqual(new Date("2026-03-23T09:00:00.000Z"));
+    // One history row covering everything up to the last boundary that passed.
+    expect(periods).toHaveLength(1);
+    expect(periods[0]).toMatchObject({
+      start: new Date("2026-02-23T09:00:00.000Z"),
+      end: new Date("2026-03-16T09:00:00.000Z"),
+    });
+  });
+
+  it("keeps a monthly goal created on the 31st on valid calendar dates", async () => {
+    const createdAt = new Date("2026-01-31T12:00:00.000Z");
+    const firstEnd = computePeriodEnd("MONTHLY", createdAt);
+    expect(firstEnd).toEqual(new Date("2026-02-28T12:00:00.000Z"));
+    const rows = createGoalStore([
+      {
+        id: 1,
+        currentAmount: 0,
+        targetAmount: 100,
+        recurring: true,
+        recurrenceInterval: "MONTHLY",
+        status: "ACTIVE",
+        currentPeriodEnd: firstEnd,
+        createdAt,
+      },
+    ]);
+    const periods = createPeriodStore();
+
+    await resetDueGoals(new Date("2026-02-28T13:00:00.000Z"));
+    expect(rows.get(1)!.currentPeriodEnd).toEqual(new Date("2026-03-28T12:00:00.000Z"));
+
+    await resetDueGoals(new Date("2026-03-28T13:00:00.000Z"));
+    expect(rows.get(1)!.currentPeriodEnd).toEqual(new Date("2026-04-28T12:00:00.000Z"));
+
+    // The first period starts at creation; later ones start where the
+    // previous recorded period ended.
+    expect(periods.map(({ start, end }) => [start.toISOString(), end.toISOString()])).toEqual([
+      ["2026-01-31T12:00:00.000Z", "2026-02-28T12:00:00.000Z"],
+      ["2026-02-28T12:00:00.000Z", "2026-03-28T12:00:00.000Z"],
+    ]);
+  });
+
+  it("steps missed months from the old end, so a clamped month doesn't pull later ends earlier", async () => {
+    const rows = createGoalStore([
+      {
+        id: 1,
+        currentAmount: 0,
+        targetAmount: 100,
+        recurring: true,
+        recurrenceInterval: "MONTHLY",
+        status: "ACTIVE",
+        currentPeriodEnd: new Date("2026-01-31T00:00:00.000Z"),
+      },
+    ]);
+    const periods = createPeriodStore();
+
+    // Feb 28 and Mar 31 both passed while the backend was down.
+    await resetDueGoals(new Date("2026-04-01T00:00:00.000Z"));
+
+    expect(rows.get(1)!.currentPeriodEnd).toEqual(new Date("2026-04-30T00:00:00.000Z"));
+    expect(periods[0].end).toEqual(new Date("2026-03-31T00:00:00.000Z"));
+  });
+
+  it("records the finished period's final amount and target outcome before zeroing it", async () => {
+    const now = new Date("2026-03-09T10:00:00.000Z");
+    const rows = createGoalStore([
+      {
+        id: 1,
+        currentAmount: new Prisma.Decimal("120.5"),
+        targetAmount: new Prisma.Decimal(100),
+        recurring: true,
+        recurrenceInterval: "WEEKLY",
+        status: "ACTIVE",
+        currentPeriodEnd: new Date("2026-03-09T09:00:00.000Z"),
+      },
+      {
+        id: 2,
+        currentAmount: 40,
+        targetAmount: 100,
+        recurring: true,
+        recurrenceInterval: "WEEKLY",
+        status: "ACTIVE",
+        currentPeriodEnd: new Date("2026-03-09T09:00:00.000Z"),
+      },
+    ]);
+    const periods = createPeriodStore([
+      {
+        goalId: 1,
+        start: new Date("2026-02-23T09:00:00.000Z"),
+        end: new Date("2026-03-02T09:00:00.000Z"),
+        raised: 80,
+        targetAmount: 100,
+        reached: false,
+      },
+    ]);
+
+    await resetDueGoals(now);
+
+    expect(mockedPrisma.goalPeriod.create).toHaveBeenCalledWith({
+      data: {
+        goalId: 1,
+        start: new Date("2026-03-02T09:00:00.000Z"),
+        end: new Date("2026-03-09T09:00:00.000Z"),
+        raised: new Prisma.Decimal("120.5"),
+        targetAmount: new Prisma.Decimal(100),
+        reached: true,
+      },
+    });
+    expect(periods.find((period) => period.goalId === 2)).toMatchObject({
+      start: new Date("2026-03-02T09:00:00.000Z"),
+      end: new Date("2026-03-09T09:00:00.000Z"),
+      raised: 40,
+      reached: false,
+    });
+    // The history row is written before the amount is zeroed.
+    const createOrder = mockedPrisma.goalPeriod.create.mock.invocationCallOrder[0];
+    const zeroOrder = mockedPrisma.goal.update.mock.invocationCallOrder[0];
+    expect(createOrder).toBeLessThan(zeroOrder);
+    expect(rows.get(1)!.currentAmount).toBe(0);
+    expect(rows.get(2)!.currentAmount).toBe(0);
   });
 
   it("does not touch goals whose period has not yet ended", async () => {

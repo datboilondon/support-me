@@ -90,4 +90,51 @@ describe('OfflineBanner', () => {
     await waitFor(() => expect(screen.getByText('Connection problem')).toBeInTheDocument());
     expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
   });
+
+  it('keeps the banner visible and shows an error toast when /health returns 503', async () => {
+    setNavigatorOnline(false);
+    render(
+      <>
+        <AppToaster />
+        <OfflineBanner />
+      </>
+    );
+
+    const banner = await screen.findByRole('status');
+    expect(banner).toHaveTextContent(/you're offline/i);
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValueOnce(new Response('Service Unavailable', { status: 503 }))
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }));
+
+    await waitFor(() =>
+      expect(screen.getByText("Still can't reach SupportMe")).toBeInTheDocument()
+    );
+    expect(screen.getByRole('status')).toBeInTheDocument();
+    expect(screen.queryByText('Back online')).not.toBeInTheDocument();
+  });
+
+  it('clears the failure and shows success toast when /health returns 200', async () => {
+    setNavigatorOnline(false);
+    render(
+      <>
+        <AppToaster />
+        <OfflineBanner />
+      </>
+    );
+
+    await screen.findByRole('status');
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValueOnce(new Response('{}', { status: 200 }))
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }));
+
+    await waitFor(() => expect(screen.getByText('Back online')).toBeInTheDocument());
+  });
 });

@@ -21,6 +21,7 @@ import request from "supertest";
 import { Keypair } from "@stellar/stellar-sdk";
 import app from "../../app";
 import prisma from "../../prisma";
+import { completeTwitterAuth } from "../../services/twitterAuth";
 import {
   challenges,
   challengeIpLimiter,
@@ -29,6 +30,8 @@ import {
   verifyWalletLimiter,
   magicLinkIpLimiter,
   magicLinkEmailLimiter,
+  twitterStartIpLimiter,
+  twitterCallbackIpLimiter,
 } from "../../routes/auth";
 import { donationIpLimiter, donationSenderLimiter } from "../../routes/donations";
 
@@ -44,6 +47,8 @@ beforeEach(() => {
     verifyWalletLimiter,
     magicLinkIpLimiter,
     magicLinkEmailLimiter,
+    twitterStartIpLimiter,
+    twitterCallbackIpLimiter,
     donationIpLimiter,
     donationSenderLimiter,
   ]) {
@@ -126,6 +131,55 @@ describe("POST /api/auth/magic-link rate limiting (#25)", () => {
     expect(res.body.code).toBe("TOO_MANY_REQUESTS");
     expect(Number(res.headers["retry-after"])).toBeGreaterThan(0);
     expect(res.body.error).toMatch(/retry in \d+ seconds/i);
+  });
+});
+
+describe("GET /api/auth/twitter rate limiting (#438)", () => {
+  it("rejects starting a sign-in past 30 a minute from one IP with 429 and Retry-After", async () => {
+    for (let i = 0; i < 30; i++) {
+      const ok = await request(app).get("/api/auth/twitter");
+      expect(ok.status).toBe(200);
+    }
+
+    const res = await request(app).get("/api/auth/twitter");
+
+    expect(res.status).toBe(429);
+    expect(res.body.code).toBe("TOO_MANY_REQUESTS");
+    expect(Number(res.headers["retry-after"])).toBeGreaterThan(0);
+    expect(res.body.error).toMatch(/retry in \d+ seconds/i);
+  });
+
+  it("rejects callbacks past 30 a minute from one IP, even when invalid", async () => {
+    (completeTwitterAuth as jest.Mock).mockResolvedValue({
+      user: { id: 1, walletAddress: null },
+      token: "signed.jwt.token",
+      hasProfile: false,
+    });
+
+    for (let i = 0; i < 30; i++) {
+      const res = await request(app)
+        .get("/api/auth/twitter/callback")
+        .query({ code: "auth-code", state: "state-value" });
+      expect(res.status).not.toBe(429);
+    }
+
+    const res = await request(app)
+      .get("/api/auth/twitter/callback")
+      .query({ code: "auth-code", state: "state-value" });
+
+    expect(res.status).toBe(429);
+    expect(res.headers["retry-after"]).toBeDefined();
+  });
+
+  it("counts a malformed callback against the IP limit too", async () => {
+    for (let i = 0; i < 30; i++) {
+      const res = await request(app).get("/api/auth/twitter/callback");
+      expect(res.status).toBe(400); // rejected by validation, but still counted
+    }
+
+    const res = await request(app).get("/api/auth/twitter/callback");
+
+    expect(res.status).toBe(429);
   });
 });
 

@@ -1,4 +1,4 @@
-import { Router, Response } from "express";
+import { Router, Response, Request } from "express";
 import { Prisma } from "@prisma/client";
 import prisma from "../prisma";
 import { authMiddleware, AuthRequest } from "../middleware/auth";
@@ -7,6 +7,7 @@ import { validate } from "../middleware/validate";
 import { deleteAccountSchema } from "../schemas/account";
 import { TooManyRequestsError, UnauthorizedError } from "../errors/AppError";
 import { RateLimiter } from "../services/rateLimiter";
+import { log } from "../lib/logger";
 
 const router = Router();
 
@@ -16,31 +17,72 @@ export const BATCH_SIZE = 500;
 export const exportRateLimiter = new RateLimiter(5, 60 * 60 * 1000);
 exportRateLimiter.startSweeping();
 
-async function streamBatchedArray<T extends { id: number }>(
+function isResponseClosed(res: Response, req?: { aborted?: boolean }): boolean {
+  return res.closed || res.destroyed || Boolean(req?.aborted);
+}
+
+async function writeResponseChunk(
+  req: Request | undefined,
+  res: Response,
+  chunk: string
+): Promise<boolean> {
+  if (isResponseClosed(res, req)) return false;
+
+  if (res.write(chunk)) return true;
+
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const settle = (continued: boolean) => {
+      if (settled) return;
+      settled = true;
+      res.removeListener("drain", onDrain);
+      res.removeListener("close", onClose);
+      req?.removeListener("close", onClose);
+      resolve(continued);
+    };
+    const onDrain = () => settle(!isResponseClosed(res, req));
+    const onClose = () => settle(false);
+
+    res.once("drain", onDrain);
+    res.once("close", onClose);
+    req?.once("close", onClose);
+  });
+}
+
+export async function streamBatchedArray<T extends { id: number }>(
   res: Response,
   fetchBatch: (cursorId: number | undefined, take: number) => Promise<T[]>,
-  batchSize = BATCH_SIZE
-): Promise<void> {
+  batchSize = BATCH_SIZE,
+  req?: Request
+): Promise<boolean> {
   let cursorId: number | undefined = undefined;
   let firstItem = true;
+  let reqClosed = false;
+  const onRequestClose = () => {
+    reqClosed = true;
+  };
+  if (req) req.once("close", onRequestClose);
 
   while (true) {
+    if (reqClosed || isResponseClosed(res, req)) break;
     const rows = await fetchBatch(cursorId, batchSize);
     if (rows.length === 0) break;
 
     for (const row of rows) {
-      if (!firstItem) {
-        res.write(",\n        ");
-      } else {
-        res.write("\n        ");
-        firstItem = false;
-      }
-      res.write(JSON.stringify(row));
+      if (reqClosed || isResponseClosed(res, req)) break;
+      const separator = firstItem ? "\n        " : ",\n        ";
+      if (!(await writeResponseChunk(req, res, separator))) break;
+      if (!(await writeResponseChunk(req, res, JSON.stringify(row)))) break;
+      firstItem = false;
     }
 
+    if (reqClosed || isResponseClosed(res, req)) break;
     if (rows.length < batchSize) break;
     cursorId = rows[rows.length - 1].id;
   }
+
+  if (req) req.removeListener("close", onRequestClose);
+  return !reqClosed && !isResponseClosed(res, req);
 }
 
 router.get(
@@ -79,58 +121,43 @@ router.get(
       deletedAt: user.deletedAt,
     };
 
-    res.write("{\n");
-    res.write(`  "exportedAt": ${JSON.stringify(new Date().toISOString())},\n`);
-    res.write(`  "user": ${JSON.stringify(userPayload, null, 2).replace(/\n/g, "\n  ")},\n`);
-    res.write(`  "creator": ${user.creator ? JSON.stringify(user.creator, null, 2).replace(/\n/g, "\n  ") : "null"},\n`);
-    res.write('  "donations": {\n    "sent": [');
+    try {
+      if (!(await writeResponseChunk(req, res, "{\n"))) return;
+      if (!(await writeResponseChunk(req, res, `  "exportedAt": ${JSON.stringify(new Date().toISOString())},\n`))) return;
+      if (!(await writeResponseChunk(req, res, `  "user": ${JSON.stringify(userPayload, null, 2).replace(/\n/g, "\n  ")},\n`))) return;
+      if (!(await writeResponseChunk(req, res, `  "creator": ${user.creator ? JSON.stringify(user.creator, null, 2).replace(/\n/g, "\n  ") : "null"},\n`))) return;
+      if (!(await writeResponseChunk(req, res, '  "donations": {\n    "sent": ['))) return;
 
-    // Stream sent donations
-    await streamBatchedArray(res, async (cursorId, take) => {
-      return prisma.donation.findMany({
-        where: { senderAddress: walletAddress },
-        orderBy: { id: "desc" },
-        take,
-        ...(cursorId !== undefined ? { cursor: { id: cursorId }, skip: 1 } : {}),
-      });
-    });
-
-    res.write('\n    ],\n    "received": [');
-
-    // Stream received donations
-    if (user.creator) {
-      await streamBatchedArray(res, async (cursorId, take) => {
+      // Stream sent donations
+      if (!(await streamBatchedArray(res, async (cursorId, take) => {
         return prisma.donation.findMany({
-          where: { creatorId: user.creator!.id },
+          where: { senderAddress: walletAddress },
           orderBy: { id: "desc" },
           take,
           ...(cursorId !== undefined ? { cursor: { id: cursorId }, skip: 1 } : {}),
         });
-      });
-    }
+      }, BATCH_SIZE, req))) return;
 
-    res.write('\n    ]\n  },\n  "subscriptions": {\n    "asSupporter": [');
+      if (!(await writeResponseChunk(req, res, '\n    ],\n    "received": ['))) return;
 
-    // Stream subscriptions as supporter
-    await streamBatchedArray(res, async (cursorId, take) => {
-      return prisma.subscription.findMany({
-        where: { supporterAddress: walletAddress },
-        orderBy: { id: "desc" },
-        take,
-        ...(cursorId !== undefined ? { cursor: { id: cursorId }, skip: 1 } : {}),
-        include: {
-          creator: { select: { username: true, displayName: true, walletAddress: true } },
-        },
-      });
-    });
+      // Stream received donations
+      if (user.creator) {
+        if (!(await streamBatchedArray(res, async (cursorId, take) => {
+          return prisma.donation.findMany({
+            where: { creatorId: user.creator!.id },
+            orderBy: { id: "desc" },
+            take,
+            ...(cursorId !== undefined ? { cursor: { id: cursorId }, skip: 1 } : {}),
+          });
+        }, BATCH_SIZE, req))) return;
+      }
 
-    res.write('\n    ],\n    "asCreator": [');
+      if (!(await writeResponseChunk(req, res, '\n    ]\n  },\n  "subscriptions": {\n    "asSupporter": ['))) return;
 
-    // Stream subscriptions as creator
-    if (user.creator) {
-      await streamBatchedArray(res, async (cursorId, take) => {
+      // Stream subscriptions as supporter
+      if (!(await streamBatchedArray(res, async (cursorId, take) => {
         return prisma.subscription.findMany({
-          where: { creatorId: user.creator!.id },
+          where: { supporterAddress: walletAddress },
           orderBy: { id: "desc" },
           take,
           ...(cursorId !== undefined ? { cursor: { id: cursorId }, skip: 1 } : {}),
@@ -138,25 +165,51 @@ router.get(
             creator: { select: { username: true, displayName: true, walletAddress: true } },
           },
         });
-      });
-    }
+      }, BATCH_SIZE, req))) return;
 
-    res.write('\n    ]\n  },\n  "withdrawals": [');
+      if (!(await writeResponseChunk(req, res, '\n    ],\n    "asCreator": ['))) return;
 
-    // Stream withdrawals
-    if (user.creator) {
-      await streamBatchedArray(res, async (cursorId, take) => {
-        return prisma.withdrawal.findMany({
-          where: { creatorId: user.creator!.id },
-          orderBy: { id: "desc" },
-          take,
-          ...(cursorId !== undefined ? { cursor: { id: cursorId }, skip: 1 } : {}),
+      // Stream subscriptions as creator
+      if (user.creator) {
+        if (!(await streamBatchedArray(res, async (cursorId, take) => {
+          return prisma.subscription.findMany({
+            where: { creatorId: user.creator!.id },
+            orderBy: { id: "desc" },
+            take,
+            ...(cursorId !== undefined ? { cursor: { id: cursorId }, skip: 1 } : {}),
+            include: {
+              creator: { select: { username: true, displayName: true, walletAddress: true } },
+            },
+          });
+        }, BATCH_SIZE, req))) return;
+      }
+
+      if (!(await writeResponseChunk(req, res, '\n    ]\n  },\n  "withdrawals": ['))) return;
+
+      // Stream withdrawals
+      if (user.creator) {
+        if (!(await streamBatchedArray(res, async (cursorId, take) => {
+          return prisma.withdrawal.findMany({
+            where: { creatorId: user.creator!.id },
+            orderBy: { id: "desc" },
+            take,
+            ...(cursorId !== undefined ? { cursor: { id: cursorId }, skip: 1 } : {}),
+          });
+        }, BATCH_SIZE, req))) return;
+      }
+
+      if (!(await writeResponseChunk(req, res, "\n  ]\n}\n"))) return;
+      return res.end();
+    } catch (error) {
+      if (!isResponseClosed(res, req)) {
+        log("error", "Account export streaming failed", {
+          requestId: req.requestId,
+          userId: req.user?.id,
+          error: error instanceof Error ? error.message : String(error),
         });
-      });
+        res.destroy();
+      }
     }
-
-    res.write("\n  ]\n}\n");
-    return res.end();
   })
 );
 

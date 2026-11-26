@@ -1,5 +1,6 @@
 import {
   AppError,
+  BadGatewayError,
   BadRequestError,
   ConflictError,
   NotFoundError,
@@ -48,6 +49,13 @@ describe("AppError subclasses", () => {
     const err = new ConflictError("Username already exists");
     expect(err.statusCode).toBe(409);
     expect(err.code).toBe("CONFLICT");
+  });
+
+  it("BadGatewayError maps to 502/BAD_GATEWAY", () => {
+    const err = new BadGatewayError("Twitter token exchange failed, please try again");
+    expect(err).toBeInstanceOf(AppError);
+    expect(err.statusCode).toBe(502);
+    expect(err.code).toBe("BAD_GATEWAY");
   });
 
   it("UnprocessableEntityError maps to 422/UNPROCESSABLE_ENTITY", () => {

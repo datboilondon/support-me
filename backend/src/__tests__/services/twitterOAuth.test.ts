@@ -1,10 +1,12 @@
 import {
+  TWITTER_REQUEST_TIMEOUT_MS,
   buildAuthorizeUrl,
   exchangeCodeForToken,
   fetchTwitterProfile,
   generatePkcePair,
   getTwitterOAuthConfig,
 } from "../../services/twitterOAuth";
+import { AppError } from "../../errors/AppError";
 
 const CONFIG = {
   clientId: "client-id",
@@ -95,16 +97,74 @@ describe("exchangeCodeForToken", () => {
     expect(body.get("grant_type")).toBe("authorization_code");
   });
 
-  it("throws with the provider's status and body when the exchange fails", async () => {
+  it("passes a timeout signal to the provider request (#438)", async () => {
+    const mockFetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ access_token: "at-1" }),
+    });
+    global.fetch = mockFetch as unknown as typeof fetch;
+
+    await exchangeCodeForToken(CONFIG, "auth-code", "verifier-value");
+
+    const [, init] = mockFetch.mock.calls[0];
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+    expect(init.signal.aborted).toBe(false);
+    expect(TWITTER_REQUEST_TIMEOUT_MS).toBeGreaterThan(0);
+  });
+
+  it("maps a rejected code to a 401 without leaking the provider body (#438)", async () => {
     global.fetch = jest.fn().mockResolvedValue({
       ok: false,
       status: 400,
-      text: async () => "invalid_grant",
+      text: async () => "invalid_grant: code expired for client-id:secret",
     }) as unknown as typeof fetch;
 
-    await expect(exchangeCodeForToken(CONFIG, "bad-code", "verifier")).rejects.toThrow(
-      /400.*invalid_grant/
-    );
+    const error = await exchangeCodeForToken(CONFIG, "bad-code", "verifier").catch((e) => e);
+
+    expect(error).toBeInstanceOf(AppError);
+    expect(error.statusCode).toBe(401);
+    expect(error.code).toBe("UNAUTHORIZED");
+    expect(error.message).not.toMatch(/invalid_grant|client-id|secret/);
+  });
+
+  it("maps a provider 5xx to a 502 without leaking the provider body (#438)", async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      text: async () => "upstream detail",
+    }) as unknown as typeof fetch;
+
+    const error = await exchangeCodeForToken(CONFIG, "auth-code", "verifier").catch((e) => e);
+
+    expect(error.statusCode).toBe(502);
+    expect(error.code).toBe("BAD_GATEWAY");
+    expect(error.message).not.toMatch(/upstream detail/);
+  });
+
+  it("fails with a 502 instead of hanging when the provider never answers (#438)", async () => {
+    // A hung endpoint surfaces as the AbortSignal.timeout() abort, i.e. a
+    // rejection distinct from any HTTP response.
+    const timeout = new Error("The operation was aborted due to timeout");
+    timeout.name = "TimeoutError";
+    global.fetch = jest.fn().mockRejectedValue(timeout) as unknown as typeof fetch;
+
+    const error = await exchangeCodeForToken(CONFIG, "auth-code", "verifier").catch((e) => e);
+
+    expect(error.statusCode).toBe(502);
+    expect(error.message).not.toMatch(/aborted/i);
+  });
+
+  it("maps an unparseable success response to a 502 rather than a 500", async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => {
+        throw new SyntaxError("Unexpected token < in JSON");
+      },
+    }) as unknown as typeof fetch;
+
+    const error = await exchangeCodeForToken(CONFIG, "auth-code", "verifier").catch((e) => e);
+
+    expect(error.statusCode).toBe(502);
   });
 });
 
@@ -139,13 +199,52 @@ describe("fetchTwitterProfile", () => {
     expect(init.headers.Authorization).toBe("Bearer my-access-token");
   });
 
-  it("throws when the profile fetch fails", async () => {
+  it("passes a timeout signal to the provider request (#438)", async () => {
+    const mockFetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: { id: "1", username: "a", name: "A" } }),
+    });
+    global.fetch = mockFetch as unknown as typeof fetch;
+
+    await fetchTwitterProfile("access-token");
+
+    const [, init] = mockFetch.mock.calls[0];
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("maps a rejected token to a 401 without leaking the provider body (#438)", async () => {
     global.fetch = jest.fn().mockResolvedValue({
       ok: false,
       status: 401,
-      text: async () => "unauthorized",
+      text: async () => "unauthorized: token expired",
     }) as unknown as typeof fetch;
 
-    await expect(fetchTwitterProfile("expired-token")).rejects.toThrow(/401.*unauthorized/);
+    const error = await fetchTwitterProfile("expired-token").catch((e) => e);
+
+    expect(error.statusCode).toBe(401);
+    expect(error.message).not.toMatch(/token expired/);
+  });
+
+  it("maps a provider 5xx to a 502 (#438)", async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      text: async () => "{\"errors\":[{\"detail\":\"internal\"}]}",
+    }) as unknown as typeof fetch;
+
+    const error = await fetchTwitterProfile("access-token").catch((e) => e);
+
+    expect(error.statusCode).toBe(502);
+    expect(error.message).not.toMatch(/internal/);
+  });
+
+  it("fails with a 502 instead of hanging when the provider never answers (#438)", async () => {
+    const timeout = new Error("The operation was aborted due to timeout");
+    timeout.name = "TimeoutError";
+    global.fetch = jest.fn().mockRejectedValue(timeout) as unknown as typeof fetch;
+
+    const error = await fetchTwitterProfile("access-token").catch((e) => e);
+
+    expect(error.statusCode).toBe(502);
   });
 });
